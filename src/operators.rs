@@ -152,10 +152,10 @@ pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor
     assert_eq!(c_shape.len(), 2, "Matrix C must be 2-dimensional");
 
     let (m, k) = (a_shape[0], a_shape[1]);   // A: m × k
-    let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × k (before transpose)
+    let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × b_k
 
-    // 检查维度匹配
-    assert_eq!(k, b_k, "Inner dimensions must match: A is {}×{}, B is {}×{}", m, k, n, b_k);
+    // 修改维度检查：A的列数(k)应该等于B的列数(b_k)
+    assert_eq!(k, b_k, "Inner dimensions must match for A @ B^T: A is {}×{}, B is {}×{}", m, k, n, b_k);
     assert_eq!(c_shape[0], m, "Output matrix C must have {} rows", m);
     assert_eq!(c_shape[1], n, "Output matrix C must have {} columns", n);
 
@@ -176,8 +176,8 @@ pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor
             // 计算 A @ B^T 的对应元素
             // C[i,j] = sum(A[i,k] * B[j,k]) 因为B是转置的
             for p in 0..k {
-                let a_idx = i * k + p;     // A[i,p]
-                let b_idx = j * k + p;     // B[j,p] (B转置前是B[j,p])
+                let a_idx = i * k + p;        // A[i,p]
+                let b_idx = j * b_k + p;      // B[j,p]
                 sum += alpha * a_data[a_idx] * b_data[b_idx];
             }
 
@@ -201,6 +201,7 @@ pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
 }
 
 // Sample a index from a tensor (treated as a probability vector)
+#[warn(dead_code)]
 pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) -> u32 {
     assert!(x.shape()[x.shape().len() - 1] == x.size());
     if temperature <= 0. || top_k < 2 || top_p <= 0. {
