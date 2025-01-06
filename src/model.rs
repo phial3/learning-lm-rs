@@ -8,6 +8,7 @@ use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
 use std::path::Path;
+
 pub struct Llama<T> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
@@ -156,6 +157,7 @@ fn self_attention(
     todo!("Implement self_attention");
 }
 
+/// 模型结构：Feed-Forward神经网络
 fn mlp(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
@@ -167,7 +169,30 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    todo!("Implement mlp");
+    // 1. hidden = rms_norm(residual)
+    OP::rms_norm(hidden_states, residual, rms_w, eps);
+
+    // 2. gate = hidden @ gate_weight.T
+    // 3. up = hidden @ up_weight.T
+    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
+    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0);
+
+    // 4. act = gate * sigmoid(gate) * up  (SwiGLU activation)
+    OP::swiglu(up, gate);
+
+    // 5. output = act @ down_weight.T
+    // 结果直接存储在 residual 中，复用内存
+    OP::matmul_transb(residual, 0.0, up, w_down, 1.0);
+
+    // 6. residual = output + residual
+    // 在获取可变引用前先获取大小
+    let residual_size = residual.size();
+    let residual_data = unsafe { residual.data_mut() };
+    let hidden_data = hidden_states.data();
+
+    for i in 0..residual_size {
+        residual_data[i] += hidden_data[i];
+    }
 }
 
 #[test]

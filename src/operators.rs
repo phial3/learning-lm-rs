@@ -138,8 +138,9 @@ pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
     }
 }
 
-// C = beta * C + alpha * A @ B^T
-// hint: You don't need to do an explicit transpose of B
+/// 矩阵乘（Transpose B）算子
+/// C = beta * C + alpha * A @ B^T
+/// hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
     // 1. 获取维度信息并进行检查
     let a_shape = a.shape();
