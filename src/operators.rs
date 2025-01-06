@@ -71,19 +71,71 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    // 1. 检查输入的合法性
+    assert_eq!(x.shape(), y.shape(), "Input and output tensors must have the same shape");
+    let x_shape = x.shape();
+    assert!(!x_shape.is_empty(), "Input tensor cannot be empty");
+
+    // 获取最后一维的大小
+    let last_dim = *x_shape.last().unwrap();
+
+    // 检查权重向量维度
+    assert_eq!(w.shape(), &vec![last_dim], "Weight tensor must match the last dimension");
+
+    // 2. 获取数据访问
+    let x_data = x.data();
+    let w_data = w.data();
+    let y_data = unsafe { y.data_mut() };
+
+    // 计算向量数量（总元素数除以最后一维的大小）
+    let total_size = x.size();
+    let num_vectors = total_size / last_dim;
+
+    // 3. 对每个向量进行 RMS Normalization
+    for i in 0..num_vectors {
+        let start_idx = i * last_dim;
+
+        // 计算均方和
+        let mut sum_squares = 0.0f32;
+        for j in 0..last_dim {
+            let val = x_data[start_idx + j];
+            sum_squares += val * val;
+        }
+
+        // 计算 RMS (root mean square)
+        let rms = (sum_squares / last_dim as f32 + epsilon).sqrt();
+
+        // 应用归一化和权重
+        for j in 0..last_dim {
+            let idx = start_idx + j;
+            y_data[idx] = (x_data[idx] / rms) * w_data[j];
+        }
+    }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size(), "Tensors must have the same size");
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
+    // Get mutable slice for y and immutable slice for x
+    let y_data = unsafe { y.data_mut() };
+    let x_data = x.data();
 
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    // Perform element-wise SwiGLU operation
+    // SwiGLU: y = silu(x) * y
+    // where silu(x) = x * sigmoid(x)
+    for i in 0..len {
+        // Calculate sigmoid(x): 1 / (1 + e^(-x))
+        let sigmoid_x = 1.0 / (1.0 + (-x_data[i]).exp());
+
+        // Calculate silu(x) = x * sigmoid(x)
+        let silu_x = x_data[i] * sigmoid_x;
+
+        // Multiply result with y (in-place)
+        y_data[i] *= silu_x;
+    }
 }
 
 // C = beta * C + alpha * A @ B^T
