@@ -141,7 +141,48 @@ pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    // 1. 获取维度信息并进行检查
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let c_shape = c.shape();
+
+    assert_eq!(a_shape.len(), 2, "Matrix A must be 2-dimensional");
+    assert_eq!(b_shape.len(), 2, "Matrix B must be 2-dimensional");
+    assert_eq!(c_shape.len(), 2, "Matrix C must be 2-dimensional");
+
+    let (m, k) = (a_shape[0], a_shape[1]);   // A: m × k
+    let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × k (before transpose)
+
+    // 检查维度匹配
+    assert_eq!(k, b_k, "Inner dimensions must match: A is {}×{}, B is {}×{}", m, k, n, b_k);
+    assert_eq!(c_shape[0], m, "Output matrix C must have {} rows", m);
+    assert_eq!(c_shape[1], n, "Output matrix C must have {} columns", n);
+
+    // 2. 获取数据访问
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
+
+    // 3. 实现 C = beta * C + alpha * A @ B^T
+    // 对每个输出元素 C[i,j] 计算
+    for i in 0..m {
+        for j in 0..n {
+            let c_idx = i * n + j;
+
+            // 首先应用 beta * C
+            let mut sum = beta * c_data[c_idx];
+
+            // 计算 A @ B^T 的对应元素
+            // C[i,j] = sum(A[i,k] * B[j,k]) 因为B是转置的
+            for p in 0..k {
+                let a_idx = i * k + p;     // A[i,p]
+                let b_idx = j * k + p;     // B[j,p] (B转置前是B[j,p])
+                sum += alpha * a_data[a_idx] * b_data[b_idx];
+            }
+
+            c_data[c_idx] = sum;
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
