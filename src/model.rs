@@ -102,17 +102,48 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
+            // Implement self-attention
+            self_attention(
+                &mut hidden_states,
+                &mut att_scores,
+                q,
+                full_k,
+                full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv,
+            );
 
-            todo!("mlp(...)");
+            // Down projection and residual connection
+            OP::matmul_transb(
+                &mut residual,
+                0.0,
+                &hidden_states,
+                &self.params.wo[layer],
+                1.0,
+            );
+
+            // MLP layer
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps,
+            );
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
         let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &vec![1, self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -134,10 +165,36 @@ impl Llama<f32> {
         top_k: u32,
         temperature: f32,
     ) -> Vec<u32>{
-        let mut result = Vec::<u32>::new();
-        
-        todo!("实现文本生成");
-        
+        let mut result = token_ids.to_vec();
+        let mut cache = self.new_cache();
+
+        while result.len() < max_len {
+            // Create input tensor from current sequence
+            let input = Tensor::new(
+                result.clone(),
+                &vec![result.len()],
+            );
+
+            // Forward pass to get logits
+            let logits = self.forward(&input, &mut cache);
+
+            // Sample next token using temperature, top_k, and top_p
+            let next_token = OP::random_sample(
+                &logits,
+                temperature,
+                top_k,
+                top_p,
+            );
+
+            // Add token to result
+            result.push(next_token);
+
+            // Check for EOS token
+            if next_token == self.eos_token_id {
+                break;
+            }
+        }
+
         result
     }
 }
@@ -148,13 +205,75 @@ fn self_attention(
     q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
     k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
     v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    n_kv_h: usize,
-    n_groups: usize,
-    seq_len: usize,
-    total_seq_len: usize,
-    dqkv: usize,
+    n_kv_h: usize,                   // number of key/value heads
+    n_groups: usize,                 // number of query groups per k/v head
+    seq_len: usize,                  // length of current sequence
+    total_seq_len: usize,            // total sequence length including past
+    dqkv: usize,                     // dimension of keys/values per head
 ) {
-    todo!("Implement self_attention");
+    for h in 0..n_kv_h {
+        // Get the keys for this head - slice with correct start index
+        let k_head = k.slice(h * dqkv, &vec![total_seq_len, dqkv]);
+
+        for g in 0..n_groups {
+            // Get queries for this group with corrected slice index
+            let q_group = q.slice(
+                (h * n_groups + g) * dqkv,
+                &vec![seq_len, dqkv]
+            );
+
+            // Get scores buffer for this head and group
+            let scores_per_group = seq_len * total_seq_len;
+            let scores_start = h * n_groups * scores_per_group + g * scores_per_group;
+            let mut scores = att_scores.slice(
+                scores_start,
+                &vec![seq_len, total_seq_len]
+            );
+
+            // Compute Q * K^T
+            unsafe {
+                let scores_data = scores.data_mut();
+                let q_data = q_group.data();
+                let k_data = k_head.data();
+
+                for i in 0..seq_len {
+                    for j in 0..total_seq_len {
+                        let mut sum = 0.0;
+                        for d in 0..dqkv {
+                            sum += q_data[i * dqkv + d] * k_data[j * dqkv + d];
+                        }
+                        scores_data[i * total_seq_len + j] = sum / (dqkv as f32).sqrt();
+                    }
+                }
+            }
+
+            // Apply softmax to scores
+            OP::masked_softmax(&mut scores);
+
+            // Get values for this head
+            let v_head = v.slice(h * dqkv, &vec![total_seq_len, dqkv]);
+
+            // Compute attention output (scores * V)
+            let out_offset = (h * n_groups + g) * dqkv;
+            let mut out = hidden_states.slice(0, &vec![seq_len, n_kv_h * n_groups * dqkv]);
+
+            unsafe {
+                let out_data = out.data_mut();
+                let scores_data = scores.data();
+                let v_data = v_head.data();
+
+                for i in 0..seq_len {
+                    for d in 0..dqkv {
+                        let mut sum = 0.0;
+                        for j in 0..total_seq_len {
+                            sum += scores_data[i * total_seq_len + j] * v_data[j * dqkv + d];
+                        }
+                        out_data[i * (n_kv_h * n_groups * dqkv) + out_offset + d] = sum;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 模型结构：Feed-Forward神经网络
