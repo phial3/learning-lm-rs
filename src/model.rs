@@ -181,9 +181,9 @@ impl Llama<f32> {
             // Sample next token using temperature, top_k, and top_p
             let next_token = OP::random_sample(
                 &logits,
-                temperature,
-                top_k,
                 top_p,
+                top_k,
+                temperature,
             );
 
             // Add token to result
