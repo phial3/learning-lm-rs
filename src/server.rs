@@ -1,6 +1,6 @@
 use crate::chat::{ChatAI, Message};
 use crate::config::{LlamaConfigJson, TorchDType};
-use crate::kvcache::{KVCache, KVCacheManager};
+use crate::kvcache::KVCacheManager;
 use crate::model;
 use crate::params::FromLeBytes;
 use axum::{
@@ -8,20 +8,17 @@ use axum::{
     extract::{Json, State},
     response::IntoResponse,
     routing::post,
-    Extension, Router, ServiceExt,
+    Extension, Router,
 };
 use futures_util::stream::StreamExt;
 use half::{bf16, f16};
 use log::info;
 use num_traits::{Float, FromPrimitive};
-use serde::{Deserialize, Serialize};
-use std::any::Any;
+use serde::Deserialize;
 use std::iter::Sum;
-use std::ops::{Deref, DerefMut};
-use std::{io, net::SocketAddr, path::PathBuf, pin::Pin, sync::Arc};
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use std::ops::DerefMut;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 // curl -N -X POST http://127.0.0.1:8000/chat \
