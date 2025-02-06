@@ -12,14 +12,14 @@ impl<T: Copy + Clone + Default> Tensor<T> {
     pub fn new(data: Vec<T>, shape: &[usize]) -> Self {
         let length = data.len();
         Tensor {
-            data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
+            data: Arc::new(data.into_boxed_slice()),
             shape: shape.to_owned(),
             offset: 0,
             length,
         }
     }
 
-    pub fn default(shape: &Vec<usize>) -> Self {
+    pub fn default(shape: &[usize]) -> Self {
         let length = shape.iter().product();
         let data = vec![T::default(); length];
         Self::new(data, shape)
@@ -151,11 +151,11 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         let mut data = vec![T::default(); self.data().len()];
         for r in 0..rows {
             for c in 0..cols {
-                data[c * rows + r] = self.data()[r * cols + c].clone();
+                data[c * rows + r] = self.data()[r * cols + c];
             }
         }
 
-        Self::new(data, &vec![cols, rows])
+        Self::new(data, &[cols, rows])
     }
     pub fn length(&self) -> usize {
         self.length

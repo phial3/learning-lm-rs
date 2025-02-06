@@ -67,13 +67,12 @@ impl<T: Default + Copy + Sum + Float + FromPrimitive + FromLeBytes> Llama<T> {
         let n_groups = self.n_q_h / self.n_kv_h;
 
         // Some pre-allocated buffers that will be reused
-        let mut residual = Tensor::<T>::default(&vec![seq_len, self.d]);
-        let mut hidden_states = Tensor::<T>::default(&vec![seq_len, self.d]);
-        let mut q_buf = Tensor::<T>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
-        let mut att_scores =
-            Tensor::<T>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
-        let mut gate_buf = Tensor::<T>::default(&vec![seq_len, self.di]);
-        let mut up_buf = Tensor::<T>::default(&vec![seq_len, self.di]);
+        let mut residual = Tensor::<T>::default(&[seq_len, self.d]);
+        let mut hidden_states = Tensor::<T>::default(&[seq_len, self.d]);
+        let mut q_buf = Tensor::<T>::default(&[seq_len, self.n_q_h * self.dqkv]);
+        let mut att_scores = Tensor::<T>::default(&[self.n_kv_h, n_groups, seq_len, total_seq_len]);
+        let mut gate_buf = Tensor::<T>::default(&[seq_len, self.di]);
+        let mut up_buf = Tensor::<T>::default(&[seq_len, self.di]);
 
         // Computation Starts Here
         // Embedding lookup
@@ -161,9 +160,9 @@ impl<T: Default + Copy + Sum + Float + FromPrimitive + FromLeBytes> Llama<T> {
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
-        let mut logits = Tensor::<T>::default(&vec![1, self.vocab]);
-        let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
+        let mut logits = Tensor::<T>::default(&[1, self.vocab]);
+        let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &[1, self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &[self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -193,8 +192,7 @@ impl<T: Default + Copy + Sum + Float + FromPrimitive + FromLeBytes> Llama<T> {
     ) -> Vec<u32> {
         let mut result_tokens = token_ids.to_vec();
         let mut kvcache = self.new_cache();
-        let mut input_tensors =
-            Tensor::<u32>::new(result_tokens.clone(), &vec![result_tokens.len()]);
+        let mut input_tensors = Tensor::<u32>::new(result_tokens.clone(), &[result_tokens.len()]);
 
         while result_tokens.len() < max_len {
             let logits = self.forward(&input_tensors, &mut kvcache);
@@ -203,7 +201,7 @@ impl<T: Default + Copy + Sum + Float + FromPrimitive + FromLeBytes> Llama<T> {
             if next_token == self.eos_token_id {
                 break;
             }
-            input_tensors = Tensor::<u32>::new(vec![next_token], &vec![1]);
+            input_tensors = Tensor::<u32>::new(vec![next_token], &[1]);
         }
 
         result_tokens
@@ -219,8 +217,7 @@ impl<T: Default + Copy + Sum + Float + FromPrimitive + FromLeBytes> Llama<T> {
         kvcache: &'a mut KVCache<T>,
     ) -> impl Iterator<Item = u32> + 'a {
         let mut result_tokens = token_ids.to_vec();
-        let mut input_tensors =
-            Tensor::<u32>::new(result_tokens.clone(), &vec![result_tokens.len()]);
+        let mut input_tensors = Tensor::<u32>::new(result_tokens.clone(), &[result_tokens.len()]);
 
         std::iter::from_fn(move || {
             if result_tokens.len() >= max_len {
@@ -230,7 +227,7 @@ impl<T: Default + Copy + Sum + Float + FromPrimitive + FromLeBytes> Llama<T> {
             let logits = self.forward(&input_tensors, kvcache);
             let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
             result_tokens.push(next_token);
-            input_tensors = Tensor::<u32>::new(vec![next_token], &vec![1]);
+            input_tensors = Tensor::<u32>::new(vec![next_token], &[1]);
 
             if next_token == self.eos_token_id {
                 None

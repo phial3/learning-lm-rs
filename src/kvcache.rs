@@ -1,7 +1,6 @@
 use crate::tensor::Tensor;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::{usize, vec};
 use tokio::sync::RwLock;
 pub struct KVCache<T> {
     k_cache: Vec<Tensor<T>>, // (max_seq_len, n_kv_head * dqkv) x layers
@@ -16,10 +15,10 @@ impl<T: Default + Copy> KVCache<T> {
     pub fn new(n_layers: usize, max_seq_len: usize, dim: usize, init_len: usize) -> Self {
         KVCache {
             k_cache: (0..n_layers)
-                .map(|_| Tensor::default(&vec![max_seq_len, dim]))
+                .map(|_| Tensor::default(&[max_seq_len, dim]))
                 .collect(),
             v_cache: (0..n_layers)
-                .map(|_| Tensor::default(&vec![max_seq_len, dim]))
+                .map(|_| Tensor::default(&[max_seq_len, dim]))
                 .collect(),
             max_seq_len,
             dim,
@@ -28,11 +27,11 @@ impl<T: Default + Copy> KVCache<T> {
     }
 
     pub fn k_cache(&mut self, layer: usize, start: usize) -> Tensor<T> {
-        self.k_cache[layer].slice(start * self.dim, &vec![self.length - start, self.dim])
+        self.k_cache[layer].slice(start * self.dim, &[self.length - start, self.dim])
     }
 
     pub fn v_cache(&mut self, layer: usize, start: usize) -> Tensor<T> {
-        self.v_cache[layer].slice(start * self.dim, &vec![self.length - start, self.dim])
+        self.v_cache[layer].slice(start * self.dim, &[self.length - start, self.dim])
     }
 
     pub fn increment(&mut self, seq_len: usize) {
@@ -79,7 +78,6 @@ impl<T: Default + Copy + Send + Sync + 'static> KVCacheManager<T> {
     }
 
     /// **存储用户 KVCache**（可以直接更新 `RwLock<KVCache<T>>`，不需要存回 `HashMap`）
-    #[allow(dead_code)]
     pub async fn store_cache_for_user(&self, _user_id: &str, _cache: Arc<RwLock<KVCache<T>>>) {
         // 这里不需要额外存储，因为 `Arc<RwLock<KVCache<T>>>` 内部已经更新
     }

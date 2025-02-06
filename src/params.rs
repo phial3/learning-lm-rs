@@ -56,8 +56,9 @@ impl<T: Copy + Clone + Default + FromLeBytes> LLamaParams<T> {
             let data = tensor_view
                 .data()
                 .chunks_exact(element_size)
-                .map(|chunk| T::from_le_bytes(chunk.try_into().unwrap()))
+                .map(T::from_le_bytes)
                 .collect::<Vec<T>>();
+
             let shape = tensor_view.shape().to_vec();
             Tensor::<T>::new(data, &shape)
         };

@@ -137,7 +137,11 @@ pub fn broadcast_tensor<T: Copy + Default>(
 
     // 4) 遍历目标张量的每个索引 i（相当于 linear index），逐步解码到各维度，然后映射回源张量。
     //    解码顺序：先 / target_shape[last] 求出“在最后一维的坐标”，再 / target_shape[last-1]...
-    for i in 0..broadcasted_size {
+    for (i, target_val) in broadcasted_data
+        .iter_mut()
+        .enumerate()
+        .take(broadcasted_size)
+    {
         let mut tmp = i;
         let mut source_index = 0;
 
@@ -166,7 +170,7 @@ pub fn broadcast_tensor<T: Copy + Default>(
         }
 
         // 根据算出的 source_index 去源张量 data() 中取值
-        broadcasted_data[i] = source_data[source_index];
+        *target_val = source_data[source_index];
     }
 
     // 5) 构造新的广播后 Tensor 返回
@@ -528,16 +532,23 @@ pub fn subtract_max(data: &mut [f32], rows: usize, cols: usize) {
         let row_start = row * cols;
         let row_end = row_start + cols;
 
+        // 使用切片获取当前行
+        let row_data = &mut data[row_start..row_end];
+
         // 找到当前行的最大值
-        let max_value = data[row_start..row_end]
+        let max_value = row_data
             .iter()
-            .cloned()
+            .copied() // 使用 copied 替代 cloned，因为 f32 是 Copy 的
             .fold(f32::NEG_INFINITY, f32::max);
 
         // 每个元素减去最大值
-        for col in row_start..row_end {
-            data[col] -= max_value;
-        }
+        // 使用 iter_mut().take().skip() 来处理当前行的元素
+        // take(row_end)   限制迭代到当前行结束位置
+        // skip(row_start) 跳过前面的行
+        data.iter_mut()
+            .take(row_end)
+            .skip(row_start)
+            .for_each(|x| *x -= max_value);
     }
 }
 

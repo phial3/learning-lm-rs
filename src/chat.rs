@@ -46,7 +46,6 @@ where
     }
 
     /// 清理用户输入
-    #[allow(dead_code)]
     fn clean_input(&self, input: &str) -> String {
         input
             .split_whitespace()
@@ -58,9 +57,9 @@ where
     /// **构造 Prompt**
     pub(crate) fn build_prompt(&self, add_generation_prompt: bool) -> String {
         let mut prompt = String::new();
-        self.messages.first().map(|msg| {
+        if let Some(msg) = self.messages.first() {
             prompt.push_str(&msg.format());
-        });
+        }
         if add_generation_prompt {
             prompt.push_str("<|im_start|>assistant\n");
         }

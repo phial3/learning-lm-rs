@@ -91,7 +91,9 @@ where
                 content: user_input.clone(),
             });
             let mut prompt = String::new();
-            messages.first().map(|msg| prompt.push_str(&msg.format()));
+            if let Some(msg) = messages.first() {
+                prompt.push_str(&msg.format())
+            }
             prompt.push_str("<|im_start|>assistant\n");
             prompt
         };
@@ -134,7 +136,7 @@ where
         // state.kvcache.store_cache_for_user(&user_id, user_kvcache).await;
     });
 
-    let body_stream = ReceiverStream::new(rx).map(|chunk| Ok::<_, std::io::Error>(chunk));
+    let body_stream = ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
     Body::from_stream(body_stream)
 }
 
