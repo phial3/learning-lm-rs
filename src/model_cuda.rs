@@ -4,11 +4,9 @@ use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
-use crate::operators::{self as OP};
+use crate::operators_cuda::{self as OP};
 use crate::params::{FromBytes, LLamaParams};
-use crate::tensor::{PrecisionCast, Tensor};
-#[cfg(feature = "web")]
-use futures::Stream;
+use crate::tensor::Tensor;
 use num_traits::Float;
 use safetensors::SafeTensors;
 use std::path::Path;
@@ -28,9 +26,10 @@ pub struct Llama<T> {
     params: LLamaParams<T>, // trained weights of this model
     bos_token_id: u32,      // start token id
     eos_token_id: u32,      // end token id
+    pub operator: OP::CudaOperator,
 }
 
-impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
+impl<T: Copy + Default + FromBytes + Float + Sum + OP::CudaDType> Llama<T> {
     pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
         let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
         let config: LlamaConfigJson = serde_json::from_reader(config).unwrap();
@@ -52,6 +51,8 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
             params: params,
             bos_token_id: config.bos_token_id,
             eos_token_id: config.eos_token_id,
+            #[cfg(feature = "cuda")]
+            operator: OP::CudaOperator::new(),
         }
     }
 
@@ -77,10 +78,11 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
 
         // Computation Starts Here
         // Embedding lookup
-        OP::gather(&mut residual, input, &self.params.embedding_table);
+        self.operator
+            .gather(&mut residual, input, &self.params.embedding_table);
 
         for layer in 0..self.n_layers {
-            OP::rms_norm(
+            self.operator.rms_norm(
                 &mut hidden_states,
                 &residual,
                 &self.params.rms_att_w[layer],
@@ -90,33 +92,34 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
             let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
             let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
-            OP::matmul_transb(
+            self.operator.matmul_transb(
                 q,
                 T::zero(),
                 &hidden_states,
                 &self.params.wq[layer],
                 T::one(),
             );
-            OP::matmul_transb(
+            self.operator.matmul_transb(
                 k,
                 T::zero(),
                 &hidden_states,
                 &self.params.wk[layer],
                 T::one(),
             );
-            OP::matmul_transb(
+            self.operator.matmul_transb(
                 v,
                 T::zero(),
                 &hidden_states,
                 &self.params.wv[layer],
                 T::one(),
             );
-            OP::rope(
+
+            self.operator.rope(
                 q.reshape(&vec![seq_len, self.n_q_h, self.dqkv]),
                 past_seq_len,
                 self.rope_theta,
             );
-            OP::rope(
+            self.operator.rope(
                 k.reshape(&vec![seq_len, self.n_kv_h, self.dqkv]),
                 past_seq_len,
                 self.rope_theta,
@@ -125,7 +128,7 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            self_attention(
+            self.operator.self_attention(
                 &mut hidden_states,
                 &mut att_scores,
                 q,
@@ -138,7 +141,7 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
                 self.dqkv,
             );
 
-            OP::matmul_transb(
+            self.operator.matmul_transb(
                 &mut residual,
                 T::one(),
                 &hidden_states,
@@ -147,6 +150,7 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
             );
 
             mlp(
+                &self.operator,
                 &mut residual,
                 &mut hidden_states,
                 &mut gate_buf,
@@ -165,14 +169,14 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
         let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
 
-        OP::rms_norm(
+        self.operator.rms_norm(
             &mut hidden_states,
             &residual,
             &self.params.rms_out_w,
             self.eps,
         );
 
-        OP::matmul_transb(
+        self.operator.matmul_transb(
             &mut logits,
             T::zero(),
             &hidden_states,
@@ -187,9 +191,9 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
         &self,
         token_ids: &[u32],
         max_len: usize,
-        top_p: T,
+        top_p: f32,
         top_k: u32,
-        temperature: T,
+        temperature: f32,
     ) -> Vec<u32> {
         let mut result = vec![self.bos_token_id];
         result.extend_from_slice(token_ids);
@@ -198,14 +202,18 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
         let input_tensor = Tensor::new(result.clone(), &vec![result.len()]);
         let logits = self.forward(&input_tensor, &mut cache);
 
-        let mut next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+        let mut next_token = self
+            .operator
+            .random_sample(&logits, top_p, top_k, temperature);
         result.push(next_token);
 
         while result.len() < max_len {
             let input_tensor = Tensor::new(vec![next_token], &vec![1]);
             let logits = self.forward(&input_tensor, &mut cache);
 
-            next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+            next_token = self
+                .operator
+                .random_sample(&logits, top_p, top_k, temperature);
 
             if next_token == self.eos_token_id {
                 break;
@@ -223,9 +231,9 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
         cache: &mut KVCache<T>,
         tokenizer: &Tokenizer,
         max_len: usize,
-        top_p: T,
+        top_p: f32,
         top_k: u32,
-        temperature: T,
+        temperature: f32,
     ) -> String {
         let encoding = tokenizer.encode(promps, false).unwrap();
         let token_ids = encoding.get_ids();
@@ -233,14 +241,18 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
         let input_tensor = Tensor::new(token_ids.to_vec(), &vec![token_ids.len()]);
         let logits = self.forward(&input_tensor, cache);
 
-        let mut next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+        let mut next_token = self
+            .operator
+            .random_sample(&logits, top_p, top_k, temperature);
         let mut result = vec![next_token];
 
         while result.len() < max_len {
             let input_tensor = Tensor::new(vec![next_token], &vec![1]);
             let logits = self.forward(&input_tensor, cache);
 
-            next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+            next_token = self
+                .operator
+                .random_sample(&logits, top_p, top_k, temperature);
 
             if next_token == self.eos_token_id {
                 break;
@@ -271,7 +283,9 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
         let input_tensor = Tensor::new(token_ids.to_vec(), &vec![token_ids.len()]);
         let logits = self.forward(&input_tensor, cache);
 
-        let mut next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+        let mut next_token = self
+            .operator
+            .random_sample(&logits, top_p, top_k, temperature);
         let mut cnt = 1;
         stream! {
             let msg = tokenizer.decode(&vec![next_token], true).unwrap();
@@ -282,7 +296,7 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
                 let input_tensor = Tensor::new(vec![next_token], &vec![1]);
                 let logits = self.forward(&input_tensor, cache);
 
-                next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+                next_token = self.operator.random_sample(&logits, top_p, top_k, temperature);
 
                 if next_token == self.eos_token_id {
                     break;
@@ -295,78 +309,8 @@ impl<T: Copy + Default + FromBytes + Float + Sum + PrecisionCast> Llama<T> {
     }
 }
 
-fn self_attention<T: Copy + Default + Float + Sum>(
-    hidden_states: &mut Tensor<T>, // (seq, n_kv_h * n_groups * dqkv)
-    att_scores: &mut Tensor<T>,    // (n_kv_h, n_groups, seq, total_seq)
-    q: &Tensor<T>,                 // (seq, n_kv_h * n_groups * dqkv)
-    k: &Tensor<T>,                 // (total_seq, n_kv_h * dqkv)
-    v: &Tensor<T>,                 // (total_seq, n_kv_h * dqkv)
-    n_kv_h: usize,
-    n_groups: usize,
-    seq_len: usize,
-    total_seq_len: usize,
-    dqkv: usize,
-) {
-    let scale = T::from(dqkv as f32).unwrap().sqrt();
-    let q_data = q.data();
-    let k_data = k.data();
-    let v_data = v.data();
-    let att_data = unsafe { att_scores.data_mut() };
-
-    for kv_head in 0..n_kv_h {
-        for group in 0..n_groups {
-            for q_seq in 0..seq_len {
-                for k_seq in 0..total_seq_len {
-                    let mut dot_product = T::zero();
-                    for d in 0..dqkv {
-                        let q_idx = q_seq * (n_kv_h * n_groups * dqkv)
-                            + (kv_head * n_groups + group) * dqkv
-                            + d;
-                        let k_idx = k_seq * (n_kv_h * dqkv) + kv_head * dqkv + d;
-                        dot_product = dot_product + q_data[q_idx] * k_data[k_idx];
-                    }
-                    let score_idx = kv_head * (n_groups * seq_len * total_seq_len)
-                        + group * (seq_len * total_seq_len)
-                        + q_seq * total_seq_len
-                        + k_seq;
-                    att_data[score_idx] = dot_product / scale;
-                }
-            }
-        }
-    }
-
-    OP::masked_softmax(att_scores);
-
-    let att_data = att_scores.data();
-    let hidden_data = unsafe { hidden_states.data_mut() };
-    for i in 0..hidden_data.len() {
-        hidden_data[i] = T::zero();
-    }
-
-    for kv_head in 0..n_kv_h {
-        for group in 0..n_groups {
-            for q_seq in 0..seq_len {
-                for d in 0..dqkv {
-                    let mut sum = T::zero();
-                    for k_seq in 0..total_seq_len {
-                        let score_idx = kv_head * (n_groups * seq_len * total_seq_len)
-                            + group * (seq_len * total_seq_len)
-                            + q_seq * total_seq_len
-                            + k_seq;
-                        let v_idx = k_seq * (n_kv_h * dqkv) + kv_head * dqkv + d;
-                        sum = sum + att_data[score_idx] * v_data[v_idx];
-                    }
-                    let out_idx = q_seq * (n_kv_h * n_groups * dqkv)
-                        + (kv_head * n_groups + group) * dqkv
-                        + d;
-                    hidden_data[out_idx] = sum;
-                }
-            }
-        }
-    }
-}
-
-fn mlp<T: Copy + Default + Float + Sum>(
+fn mlp<T: Copy + Default + Float + Sum + OP::CudaDType>(
+    op: &OP::CudaOperator,
     residual: &mut Tensor<T>,
     hidden_states: &mut Tensor<T>,
     gate: &mut Tensor<T>,
@@ -377,11 +321,11 @@ fn mlp<T: Copy + Default + Float + Sum>(
     rms_w: &Tensor<T>,
     eps: T,
 ) {
-    OP::rms_norm(hidden_states, residual, rms_w, eps);
-    OP::matmul_transb(gate, T::zero(), hidden_states, w_gate, T::one());
-    OP::matmul_transb(up, T::zero(), hidden_states, w_up, T::one());
-    OP::swiglu(up, gate);
-    OP::matmul_transb(residual, T::one(), up, w_down, T::one());
+    op.rms_norm(hidden_states, residual, rms_w, eps);
+    op.matmul_transb(gate, T::zero(), hidden_states, w_gate, T::one());
+    op.matmul_transb(up, T::zero(), hidden_states, w_up, T::one());
+    op.swiglu(up, gate);
+    op.matmul_transb(residual, T::one(), up, w_down, T::one());
 }
 
 #[test]
@@ -398,7 +342,9 @@ pub fn test_mlp() {
     let w_gate = Tensor::<f32>::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], &vec![di, d]);
     let rms_w = Tensor::<f32>::new(vec![1., 1.], &vec![d]);
     let eps = 1e-6;
+    let op = OP::CudaOperator::new();
     mlp(
+        &op,
         &mut residual,
         &mut hidden_states,
         &mut gate_buf,

@@ -2,10 +2,42 @@
 name = "learning-lm-rust"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "web"
+path = "src/bin/web.rs"
+required-features = ["web"]
+
+[[bin]]
+name = "chat"
+path = "src/bin/chat.rs"
+
+[[bin]]
+name = "story"
+path = "src/bin/story.rs"
+
+
+[features]
+web = ["dep:ntex", "dep:parking_lot", "dep:async-stream", "dep:futures-util", "dep:tokio", "dep:futures"]
+cuda = ["dep:cudarc", "dep:bindgen_cuda"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-safetensors = "0.4.3"
-tokenizers = "0.19.1"
-rand = "0.8"
+safetensors = "0.5"
+tokenizers = "0.21"
+rand = "0.9"
+bytemuck = "1.21"
+num-traits = "0.2"
+half = {version = "2.4", features = ["num-traits"]}
+parking_lot = { version = "0.12.3", optional = true }
+ntex = { version = "2.11.0", features = ["tokio"], optional = true }
+cudarc = { version = "0.13.4", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"], default-features=false, optional = true }
+async-stream = {version = "0.3.6", optional = true}
+futures-util = {version = "0.3.31", optional = true}
+tokio = {version = "1.43.0", features = ["sync"], optional = true}
+futures = {version = "0.3.31", optional = true}
+
+[build-dependencies]
+bindgen_cuda = { version = "0.1.5", optional = true }

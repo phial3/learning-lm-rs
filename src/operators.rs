@@ -1,7 +1,11 @@
+use std::iter::Sum;
+
+use num_traits::Float;
+
 use crate::tensor::Tensor;
 
 // get (row) vectors from a 2D table given a list of indices
-pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
+pub fn gather<T: Copy + Default>(y: &mut Tensor<T>, indices: &Tensor<u32>, table: &Tensor<T>) {
     let length = indices.size();
     let table_shape = table.shape();
     assert!(table_shape.len() == 2);
@@ -15,7 +19,7 @@ pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
 }
 
 // RoPE: Rotary Positional Embedding
-pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
+pub fn rope<T: Copy + Default + Float>(y: &mut Tensor<T>, start_pos: usize, theta: T) {
     let shape = y.shape();
     assert!(shape.len() == 3);
     let seq_len = shape[0];
@@ -28,7 +32,8 @@ pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
             for i in 0..d / 2 {
                 let a = data[tok * n_heads * d + head * d + i];
                 let b = data[tok * n_heads * d + head * d + i + d / 2];
-                let freq = pos as f32 / theta.powf((i * 2) as f32 / d as f32);
+                let freq = T::from(pos).unwrap()
+                    / theta.powf(T::from(i * 2).unwrap() / T::from(d).unwrap());
                 let (sin, cos) = freq.sin_cos();
                 data[tok * n_heads * d + head * d + i] = a * cos - b * sin;
                 data[tok * n_heads * d + head * d + i + d / 2] = b * cos + a * sin;
@@ -39,7 +44,7 @@ pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
 
 // softmax(x) = exp(x - max) / sum(exp(x - max))
 // y = softmax(mask(x))
-pub fn masked_softmax(y: &mut Tensor<f32>) {
+pub fn masked_softmax<T: Copy + Default + Float + Sum>(y: &mut Tensor<T>) {
     let ndim = y.shape().len();
     assert!(ndim >= 2);
     let seq_len = y.shape()[ndim - 2];
@@ -62,149 +67,107 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
                     data[offset + j] = e;
                     e
                 })
-                .sum::<f32>();
+                .sum::<T>();
 
-            (0..boundary).for_each(|j| data[offset + j] /= sum);
-            (boundary..total_seq_len).for_each(|j| data[offset + j] = 0.0);
+            (0..boundary).for_each(|j| data[offset + j] = data[offset + j] / sum);
+            (boundary..total_seq_len).for_each(|j| data[offset + j] = T::zero());
         }
     }
 }
 
-pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    // 1. 检查输入的合法性
-    assert_eq!(x.shape(), y.shape(), "Input and output tensors must have the same shape");
-    let x_shape = x.shape();
-    assert!(!x_shape.is_empty(), "Input tensor cannot be empty");
-
-    // 获取最后一维的大小
-    let last_dim = *x_shape.last().unwrap();
-
-    // 检查权重向量维度
-    assert_eq!(w.shape(), &vec![last_dim], "Weight tensor must match the last dimension");
-
-    // 2. 获取数据访问
-    let x_data = x.data();
-    let w_data = w.data();
+pub fn rms_norm<T: Copy + Default + Float + Sum>(
+    y: &mut Tensor<T>,
+    x: &Tensor<T>,
+    w: &Tensor<T>,
+    epsilon: T,
+) {
+    let len = y.size();
+    assert!(len == x.size());
+    let shape = y.shape().clone();
     let y_data = unsafe { y.data_mut() };
-
-    // 计算向量数量（总元素数除以最后一维的大小）
-    let total_size = x.size();
-    let num_vectors = total_size / last_dim;
-
-    // 3. 对每个向量进行 RMS Normalization
-    for i in 0..num_vectors {
-        let start_idx = i * last_dim;
-
-        // 计算均方和
-        let mut sum_squares = 0.0f32;
-        for j in 0..last_dim {
-            let val = x_data[start_idx + j];
-            sum_squares += val * val;
+    let x = x.data();
+    let w = w.data();
+    for i in 0..shape[0] {
+        let mut sum = T::zero();
+        for j in 0..shape[1] {
+            sum = sum + x[i * shape[1] + j] * x[i * shape[1] + j];
         }
-
-        // 计算 RMS (root mean square)
-        let rms = (sum_squares / last_dim as f32 + epsilon).sqrt();
-
-        // 应用归一化和权重
-        for j in 0..last_dim {
-            let idx = start_idx + j;
-            y_data[idx] = (x_data[idx] / rms) * w_data[j];
+        let rms = (sum / T::from(shape[1]).unwrap() + epsilon).sqrt();
+        for j in 0..shape[1] {
+            let idx = i * shape[1] + j;
+            y_data[idx] = w[j] * (x[idx] / rms);
         }
     }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
-pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
+pub fn swiglu<T: Copy + Default + Float + Sum>(y: &mut Tensor<T>, x: &Tensor<T>) {
     let len = y.size();
-    assert!(len == x.size(), "Tensors must have the same size");
+    assert!(len == x.size());
 
-    // Get mutable slice for y and immutable slice for x
-    let y_data = unsafe { y.data_mut() };
-    let x_data = x.data();
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
 
-    // Perform element-wise SwiGLU operation
-    // SwiGLU: y = silu(x) * y
-    // where silu(x) = x * sigmoid(x)
-    for i in 0..len {
-        // Calculate sigmoid(x): 1 / (1 + e^(-x))
-        let sigmoid_x = 1.0 / (1.0 + (-x_data[i]).exp());
-
-        // Calculate silu(x) = x * sigmoid(x)
-        let silu_x = x_data[i] * sigmoid_x;
-
-        // Multiply result with y (in-place)
-        y_data[i] *= silu_x;
+    let _x = _x
+        .iter()
+        .map(|the_x| *the_x * (T::one() / (T::one() + (-*the_x).exp())))
+        .collect::<Vec<T>>();
+    let mut idx = 0;
+    for the_y in _y.iter_mut() {
+        *the_y = *the_y * _x[idx];
+        idx += 1;
     }
 }
 
-/// 矩阵乘（Transpose B）算子
-/// C = beta * C + alpha * A @ B^T
-/// hint: You don't need to do an explicit transpose of B
-pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    // 1. 获取维度信息并进行检查
-    let a_shape = a.shape();
-    let b_shape = b.shape();
-    let c_shape = c.shape();
-
-    assert_eq!(a_shape.len(), 2, "Matrix A must be 2-dimensional");
-    assert_eq!(b_shape.len(), 2, "Matrix B must be 2-dimensional");
-    assert_eq!(c_shape.len(), 2, "Matrix C must be 2-dimensional");
-
-    let (m, k) = (a_shape[0], a_shape[1]);   // A: m × k
-    let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × b_k
-
-    // 修改维度检查：A的列数(k)应该等于B的列数(b_k)
-    assert_eq!(k, b_k, "Inner dimensions must match for A @ B^T: A is {}×{}, B is {}×{}", m, k, n, b_k);
-    assert_eq!(c_shape[0], m, "Output matrix C must have {} rows", m);
-    assert_eq!(c_shape[1], n, "Output matrix C must have {} columns", n);
-
-    // 2. 获取数据访问
-    let a_data = a.data();
-    let b_data = b.data();
+// C = beta * C + alpha * A @ B^T
+// hint: You don't need to do an explicit transpose of B
+pub fn matmul_transb<T: Copy + Default + Float>(
+    c: &mut Tensor<T>,
+    beta: T,
+    a: &Tensor<T>,
+    b: &Tensor<T>,
+    alpha: T,
+) {
+    let (m, n) = (a.shape()[0], a.shape()[1]);
+    let p = b.shape()[0];
     let c_data = unsafe { c.data_mut() };
-
-    // 3. 实现 C = beta * C + alpha * A @ B^T
-    // 对每个输出元素 C[i,j] 计算
+    let a = a.data();
+    let b = b.data();
     for i in 0..m {
-        for j in 0..n {
-            let c_idx = i * n + j;
-
-            // 首先应用 beta * C
-            let mut sum = beta * c_data[c_idx];
-
-            // 计算 A @ B^T 的对应元素
-            // C[i,j] = sum(A[i,k] * B[j,k]) 因为B是转置的
-            for p in 0..k {
-                let a_idx = i * k + p;        // A[i,p]
-                let b_idx = j * b_k + p;      // B[j,p]
-                sum += alpha * a_data[a_idx] * b_data[b_idx];
+        for j in 0..p {
+            let mut sum = T::zero();
+            for k in 0..n {
+                sum = sum + a[i * n + k] * b[j * n + k];
             }
-
-            c_data[c_idx] = sum;
+            c_data[i * p + j] = beta * c_data[i * p + j] + alpha * sum;
         }
     }
 }
 
 // Dot product of two tensors (treated as vectors)
 #[allow(unused)]
-pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
+pub fn dot<T: Copy + Default + Float>(x: &Tensor<T>, y: &Tensor<T>) -> T {
     let len = x.size();
     assert!(len == y.size());
     let x_ = x.data();
     let y_ = y.data();
-    let mut sum = 0.0;
+    let mut sum = T::zero();
     for i in 0..len {
-        sum += x_[i] * y_[i];
+        sum = sum + x_[i] * y_[i];
     }
     sum
 }
 
 // Sample a index from a tensor (treated as a probability vector)
-#[warn(dead_code)]
-pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) -> u32 {
+pub fn random_sample<T: Copy + Default + Float>(
+    x: &Tensor<T>,
+    top_p: T,
+    top_k: u32,
+    temperature: T,
+) -> u32 {
     assert!(x.shape()[x.shape().len() - 1] == x.size());
-    if temperature <= 0. || top_k < 2 || top_p <= 0. {
+    if temperature <= T::zero() || top_k < 2 || top_p <= T::zero() {
         return x
             .data()
             .iter()
@@ -235,11 +198,11 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
             }
         }
     }
-    impl From<(usize, &f32)> for Probability {
+    impl<T: Float> From<(usize, &T)> for Probability {
         #[inline]
-        fn from((i, p): (usize, &f32)) -> Self {
+        fn from((i, p): (usize, &T)) -> Self {
             Self {
-                val: p.clone(),
+                val: p.to_f32().unwrap(),
                 tok: i as _,
             }
         }
@@ -256,11 +219,12 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
     let max = core::mem::replace(&mut logits[0].val, 1.);
     // softmax & sum
     for i in 1..logits.len() {
-        logits[i].val = logits[i - 1].val + ((logits[i].val - max) / temperature).exp();
+        logits[i].val =
+            logits[i - 1].val + ((logits[i].val - max) / temperature.to_f32().unwrap()).exp();
     }
     // topk & topp & random
     let pk = logits[(top_k as usize).min(logits.len()) - 1].val;
-    let pp = logits[logits.len() - 1].val * top_p;
+    let pp = logits[logits.len() - 1].val * top_p.to_f32().unwrap();
     let plimit = rand::random::<f32>() * f32::min(pk, pp);
     // sample
     logits.iter().find(|p| p.val >= plimit).unwrap().tok
@@ -301,6 +265,30 @@ fn test_matmul_transb() {
     matmul_transb(&mut c, 1., &a, &b, 1.);
     assert!(c.close_to(
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
+        1e-3
+    ));
+}
+
+#[test]
+pub fn test_mulmat_transb2() {
+    let a = Tensor::<f32>::new(
+        vec![
+            0.9999995, 0.9999995, 0.9999995, 0.9999995, 0.9999995, 0.9999995, 0.9999995, 0.9999995,
+        ],
+        &vec![4, 2],
+    );
+    let b = Tensor::<f32>::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], &vec![3, 2]);
+    let mut c = Tensor::<f32>::default(&vec![4, 3]);
+
+    matmul_transb(&mut c, 0., &a, &b, 1.);
+    assert!(c.close_to(
+        &Tensor::<f32>::new(
+            vec![
+                0.29999986, 0.6999997, 1.0999994, 0.29999986, 0.6999997, 1.0999994, 0.29999986,
+                0.6999997, 1.0999994, 0.29999986, 0.6999997, 1.0999994
+            ],
+            &vec![4, 3]
+        ),
         1e-3
     ));
 }

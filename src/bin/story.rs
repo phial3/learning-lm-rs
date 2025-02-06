@@ -1,9 +1,7 @@
-mod config;
-mod kvcache;
-mod model;
-mod operators;
-mod params;
-mod tensor;
+#[cfg(not(feature = "cuda"))]
+use learning_lm_rust::model::{self as model};
+#[cfg(feature = "cuda")]
+use learning_lm_rust::model_cuda::{self as model};
 
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -17,12 +15,6 @@ fn main() {
     let binding = tokenizer.encode(input, true).unwrap();
     let input_ids = binding.get_ids();
     print!("\n{}", input);
-    let output_ids = llama.generate(
-        input_ids,
-        500,
-        0.8,
-        30,
-        1.,
-    );
+    let output_ids = llama.generate(input_ids, 500, 0.8, 30, 1.);
     println!("{}", tokenizer.decode(&output_ids, true).unwrap());
 }
