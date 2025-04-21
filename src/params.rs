@@ -1,7 +1,27 @@
 use crate::config::LlamaConfigJson;
 use crate::tensor::Tensor;
+use half::{bf16, f16};
 use safetensors::SafeTensors;
+use std::mem;
 
+pub trait FromLeBytes: Sized {
+    fn from_le_bytes(bytes: &[u8]) -> Self;
+}
+impl FromLeBytes for f32 {
+    fn from_le_bytes(bytes: &[u8]) -> Self {
+        f32::from_le_bytes(bytes.try_into().expect("Invalid byte length for f32"))
+    }
+}
+impl FromLeBytes for f16 {
+    fn from_le_bytes(bytes: &[u8]) -> Self {
+        f16::from_le_bytes([bytes[0], bytes[1]])
+    }
+}
+impl FromLeBytes for bf16 {
+    fn from_le_bytes(bytes: &[u8]) -> Self {
+        bf16::from_le_bytes([bytes[0], bytes[1]])
+    }
+}
 pub struct LLamaParams<T> {
     // token_id to embedding lookup table
     pub embedding_table: Tensor<T>, // (vocab_size, dim)
@@ -21,71 +41,107 @@ pub struct LLamaParams<T> {
     pub lm_head: Tensor<T>,   // (vocab_size, dim)
 }
 
-impl LLamaParams<f32> {
-    // Helper function to convert u8 slice to f32 vector
-    fn u8_to_f32_vec(data: &[u8]) -> Vec<f32> {
-        // 检查数据长度是否是4的倍数
-        assert!(
-            data.len() % 4 == 0,
-            "Input &[u8] length must be a multiple of 4"
-        );
-
-        // 每4字节解析为一个f32
-        data.chunks(4)
-            .map(|chunk| {
-                let bytes: [u8; 4] = chunk.try_into().expect("Chunk size should be 4");
-                f32::from_le_bytes(bytes) // 假设数据是小端序（LE）
-            })
-            .collect()
-    }
-
+impl<T: Copy + Default + FromLeBytes + 'static> LLamaParams<T> {
     pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson) -> Self {
-        // 首先打印所有可用的张量名称，帮助调试
-        println!("Available tensors:");
-        for name in safetensor.names() {
-            println!("  {}", name);
-        }
-        println!("-----------");
-        
-        // Helper closure to load a tensor by name
-        let get_tensor = |name: &str| {
-            let tensor_data = safetensor
+        let get_tensor = |name: &str| -> Tensor<T> {
+            let tensor = safetensor
                 .tensor(name)
-                .unwrap_or_else(|_| panic!("Tensor {name} not found in safetensors file"));
-            let shape = tensor_data
-                .shape()
-                .to_vec();
-            let float_data = Self::u8_to_f32_vec(tensor_data.data());
-            //println!("get the tensor {} successfully", name);
-            Tensor::new(float_data, &shape)
+                .unwrap_or_else(|_| panic!("Tensor {} not found", name));
+            let tensor_dtype = tensor.dtype();
+            let element_size = match tensor_dtype {
+                safetensors::Dtype::F32 => mem::size_of::<f32>(),
+                safetensors::Dtype::F16 => mem::size_of::<f16>(),
+                _ => panic!("Unsupported data type: {:?}", tensor_dtype),
+            };
+
+            let data_bytes = tensor.data();
+            let shape = tensor.shape().to_vec();
+            // 将字节数组解析为指定的数据类型
+            let data = data_bytes
+                .chunks_exact(element_size)
+                .map(|chunk| T::from_le_bytes(chunk))
+                .collect::<Vec<T>>();
+
+            Tensor::new(data, &shape)
         };
 
-        // Helper function to load a vector of tensors for each layer
-        let load_layers = |prefix: &str, layers: usize| -> Vec<Tensor<f32>> {
-            (0..layers)
-                .map(|i| get_tensor(&format!("model.layers.{}.{}", i, prefix)))
-                .collect()
+        let lm_head = get_tensor("lm_head.weight");
+
+        // 处理共享参数：通过复制数据创建新Tensor
+        let embedding_table = if config.tie_word_embeddings {
+            let data = lm_head.data().to_vec(); // 复制数据
+            let shape = lm_head.shape().clone();
+            Tensor::new(data, &shape)
+        } else {
+            get_tensor("model.embed_tokens.weight")
         };
 
-        // Construct LLamaParams using get_tensor and load_layers
-        LLamaParams {
-            //embedding_table: get_tensor("lm_head.weight"), // 不是很理解
-            embedding_table: if config.tie_word_embeddings {
-                get_tensor("lm_head.weight")
-            } else {
-                get_tensor("model.embed_tokens.weight")
-            },
-            rms_att_w: load_layers("input_layernorm.weight", config.num_hidden_layers),
-            wq: load_layers("self_attn.q_proj.weight", config.num_hidden_layers),
-            wk: load_layers("self_attn.k_proj.weight", config.num_hidden_layers),
-            wv: load_layers("self_attn.v_proj.weight", config.num_hidden_layers),
-            wo: load_layers("self_attn.o_proj.weight", config.num_hidden_layers),
-            rms_ffn_w: load_layers("post_attention_layernorm.weight", config.num_hidden_layers),
-            w_up: load_layers("mlp.up_proj.weight", config.num_hidden_layers),
-            w_gate: load_layers("mlp.gate_proj.weight", config.num_hidden_layers),
-            w_down: load_layers("mlp.down_proj.weight", config.num_hidden_layers),
-            rms_out_w: get_tensor("model.norm.weight"),
-            lm_head: get_tensor("lm_head.weight"),
+        // 加载各层参数（与原代码一致）
+        let num_hidden_layers = config.num_hidden_layers;
+        let mut rms_att_w = Vec::with_capacity(num_hidden_layers);
+        let mut wq = Vec::with_capacity(num_hidden_layers);
+        let mut wk = Vec::with_capacity(num_hidden_layers);
+        let mut wv = Vec::with_capacity(num_hidden_layers);
+        let mut wo = Vec::with_capacity(num_hidden_layers);
+        let mut rms_ffn_w = Vec::with_capacity(num_hidden_layers);
+        let mut w_up = Vec::with_capacity(num_hidden_layers);
+        let mut w_gate = Vec::with_capacity(num_hidden_layers);
+        let mut w_down = Vec::with_capacity(num_hidden_layers);
+
+        for layer_idx in 0..num_hidden_layers {
+            rms_att_w.push(get_tensor(&format!(
+                "model.layers.{}.input_layernorm.weight",
+                layer_idx
+            )));
+            wq.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.q_proj.weight",
+                layer_idx
+            )));
+            wk.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.k_proj.weight",
+                layer_idx
+            )));
+            wv.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.v_proj.weight",
+                layer_idx
+            )));
+            wo.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.o_proj.weight",
+                layer_idx
+            )));
+            rms_ffn_w.push(get_tensor(&format!(
+                "model.layers.{}.post_attention_layernorm.weight",
+                layer_idx
+            )));
+            w_up.push(get_tensor(&format!(
+                "model.layers.{}.mlp.up_proj.weight",
+                layer_idx
+            )));
+            w_gate.push(get_tensor(&format!(
+                "model.layers.{}.mlp.gate_proj.weight",
+                layer_idx
+            )));
+            w_down.push(get_tensor(&format!(
+                "model.layers.{}.mlp.down_proj.weight",
+                layer_idx
+            )));
+        }
+
+        let rms_out_w = get_tensor("model.norm.weight");
+
+        Self {
+            embedding_table,
+            rms_att_w,
+            wq,
+            wk,
+            wv,
+            wo,
+            rms_ffn_w,
+            w_up,
+            w_gate,
+            w_down,
+            rms_out_w,
+            lm_head,
         }
     }
 }
