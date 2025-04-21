@@ -1,5 +1,4 @@
 use crate::tensor::Tensor;
-
 pub struct KVCache<T> {
     k_cache: Vec<Tensor<T>>, // (max_seq_len, n_kv_head * dqkv) x layers
     v_cache: Vec<Tensor<T>>, // (max_seq_len, n_kv_head * dqkv) x layers
@@ -9,7 +8,7 @@ pub struct KVCache<T> {
     length: usize, // length of the current sequence
 }
 
-impl<T: Default + Copy> KVCache<T> {
+impl<T: Default + Copy + Clone> KVCache<T> {
     pub fn new(n_layers: usize, max_seq_len: usize, dim: usize, init_len: usize) -> Self {
         KVCache {
             k_cache: (0..n_layers)
@@ -38,5 +37,16 @@ impl<T: Default + Copy> KVCache<T> {
 
     pub fn len(&self) -> usize {
         self.length
+    }
+}
+impl<T: Default + Copy> Clone for KVCache<T> {
+    fn clone(&self) -> Self {
+        KVCache {
+            k_cache: self.k_cache.iter().map(|t| t.clone()).collect(),
+            v_cache: self.v_cache.iter().map(|t| t.clone()).collect(),
+            max_seq_len: self.max_seq_len,
+            dim: self.dim,
+            length: self.length,
+        }
     }
 }

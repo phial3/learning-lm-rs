@@ -61,6 +61,15 @@ impl<T: Copy + Clone + Default> Tensor<T> {
             length: new_length,
         }
     }
+
+    pub fn clone(&self) -> Self {
+        Tensor {
+            data: Arc::clone(&self.data),
+            shape: self.shape.clone(),
+            offset: self.offset,
+            length: self.length,
+        }
+    }
 }
 
 // Some helper functions for testing and debugging
