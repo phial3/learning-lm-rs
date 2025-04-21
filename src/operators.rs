@@ -59,7 +59,7 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
             let sum = (0..boundary)
                 .map(|j| {
                     let e = (data[offset + j] - max).exp();
-                    data[offset + j] = e;
+                    data[offset + j] = e; // Q：所以这里改变了原有内存的值啊啊啊？
                     e
                 })
                 .sum::<f32>();
@@ -71,117 +71,100 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    // 1. 检查输入的合法性
-    assert_eq!(x.shape(), y.shape(), "Input and output tensors must have the same shape");
-    let x_shape = x.shape();
-    assert!(!x_shape.is_empty(), "Input tensor cannot be empty");
+    // todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let ndim = y.shape().len();
+    assert!(ndim >= 2);
+    let seq_len = y.shape()[ndim - 2]; // xi yi
+    let total_seq_len = y.shape()[ndim - 1]; // n
+    let batch = y.size() / (seq_len * total_seq_len);
+    assert_eq!(w.shape()[w.shape().len() - 1], total_seq_len);
+    let (_x, _y, _w) = (x.data(), unsafe { y.data_mut() }, w.data());
+    for b in 0..batch {
+        let base = b * seq_len * total_seq_len;
+        for i in 0..seq_len {
+            // xi yi
+            let offset = base + i * total_seq_len;
+            let xi2_mean = (0..total_seq_len)
+                .map(|idx| _x[offset + idx] * _x[offset + idx])
+                .sum::<f32>()
+                / total_seq_len as f32;
 
-    // 获取最后一维的大小
-    let last_dim = *x_shape.last().unwrap();
-
-    // 检查权重向量维度
-    assert_eq!(w.shape(), &vec![last_dim], "Weight tensor must match the last dimension");
-
-    // 2. 获取数据访问
-    let x_data = x.data();
-    let w_data = w.data();
-    let y_data = unsafe { y.data_mut() };
-
-    // 计算向量数量（总元素数除以最后一维的大小）
-    let total_size = x.size();
-    let num_vectors = total_size / last_dim;
-
-    // 3. 对每个向量进行 RMS Normalization
-    for i in 0..num_vectors {
-        let start_idx = i * last_dim;
-
-        // 计算均方和
-        let mut sum_squares = 0.0f32;
-        for j in 0..last_dim {
-            let val = x_data[start_idx + j];
-            sum_squares += val * val;
-        }
-
-        // 计算 RMS (root mean square)
-        let rms = (sum_squares / last_dim as f32 + epsilon).sqrt();
-
-        // 应用归一化和权重
-        for j in 0..last_dim {
-            let idx = start_idx + j;
-            y_data[idx] = (x_data[idx] / rms) * w_data[j];
+            let rms = (xi2_mean + epsilon).sqrt();
+            for j in 0..total_seq_len {
+                _y[offset + j] = (_w[j] * _x[offset + j]) / rms;
+            }
         }
     }
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn silu(x: f32) -> f32 {
+    sigmoid(x) * x
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
     let len = y.size();
-    assert!(len == x.size(), "Tensors must have the same size");
+    assert!(len == x.size());
 
-    // Get mutable slice for y and immutable slice for x
-    let y_data = unsafe { y.data_mut() };
-    let x_data = x.data();
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
 
-    // Perform element-wise SwiGLU operation
-    // SwiGLU: y = silu(x) * y
-    // where silu(x) = x * sigmoid(x)
     for i in 0..len {
-        // Calculate sigmoid(x): 1 / (1 + e^(-x))
-        let sigmoid_x = 1.0 / (1.0 + (-x_data[i]).exp());
-
-        // Calculate silu(x) = x * sigmoid(x)
-        let silu_x = x_data[i] * sigmoid_x;
-
-        // Multiply result with y (in-place)
-        y_data[i] *= silu_x;
+        _y[i] *= silu(_x[i]);
     }
+
+    // todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
 }
 
-/// 矩阵乘（Transpose B）算子
-/// C = beta * C + alpha * A @ B^T
-/// hint: You don't need to do an explicit transpose of B
+// C = beta * C + alpha * A @ B^T
+// hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    // 1. 获取维度信息并进行检查
-    let a_shape = a.shape();
-    let b_shape = b.shape();
-    let c_shape = c.shape();
-
-    assert_eq!(a_shape.len(), 2, "Matrix A must be 2-dimensional");
-    assert_eq!(b_shape.len(), 2, "Matrix B must be 2-dimensional");
-    assert_eq!(c_shape.len(), 2, "Matrix C must be 2-dimensional");
-
-    let (m, k) = (a_shape[0], a_shape[1]);   // A: m × k
-    let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × b_k
-
-    // 修改维度检查：A的列数(k)应该等于B的列数(b_k)
-    assert_eq!(k, b_k, "Inner dimensions must match for A @ B^T: A is {}×{}, B is {}×{}", m, k, n, b_k);
-    assert_eq!(c_shape[0], m, "Output matrix C must have {} rows", m);
-    assert_eq!(c_shape[1], n, "Output matrix C must have {} columns", n);
-
-    // 2. 获取数据访问
-    let a_data = a.data();
-    let b_data = b.data();
-    let c_data = unsafe { c.data_mut() };
-
-    // 3. 实现 C = beta * C + alpha * A @ B^T
-    // 对每个输出元素 C[i,j] 计算
-    for i in 0..m {
-        for j in 0..n {
-            let c_idx = i * n + j;
-
-            // 首先应用 beta * C
-            let mut sum = beta * c_data[c_idx];
-
-            // 计算 A @ B^T 的对应元素
-            // C[i,j] = sum(A[i,k] * B[j,k]) 因为B是转置的
-            for p in 0..k {
-                let a_idx = i * k + p;        // A[i,p]
-                let b_idx = j * b_k + p;      // B[j,p]
-                sum += alpha * a_data[a_idx] * b_data[b_idx];
+    // 默认第二个向量制动专职，即：b，是b.T！
+    // `A` 形状为 `m×k`，`B` 形状为 `n×k`，`C` 形状为 `m×n`
+    // todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    // 目前偷个小懒，暂不实现广播
+    let c_size = c.size();
+    let c_shape = c.shape().clone();
+    let (a_dim, b_dim, c_dim) = (a.shape().len(), b.shape().len(), c_shape.len());
+    // 你可以默认输入输出都是二维矩阵，即 `A` 形状为 `m×k`，`B` 形状为 `n×k`，`C` 形状为 `m×n`，可以不用考虑广播的情况
+    let (_a, _b, _c) = (a.data(), b.data(), unsafe { c.data_mut() });
+    assert!(a_dim >= 2);
+    assert!(b_dim >= 2);
+    assert!(c_dim >= 2);
+    assert!(a.shape()[a_dim - 2] == c_shape[c_dim - 2]); // m
+    assert!(a.shape()[a_dim - 1] == b.shape()[b_dim - 1]); // k
+    assert!(b.shape()[b_dim - 2] == c_shape[c_dim - 1]); // n
+    let (m, k, n) = (
+        a.shape()[a_dim - 2],
+        a.shape()[a_dim - 1],
+        b.shape()[b_dim - 2],
+    );
+    // 以C为基准进行循环最好
+    let batch = c_size / (m * n);
+    // 在有`batch`的情况下对abc进行索引
+    let clip_a = |bh, i, j| {
+        let base = bh * m * k;
+        _a[base + i * k + j]
+    };
+    let clip_b = |bh, i, j| {
+        let base = bh * k * n;
+        _b[base + i * k + j]
+    };
+    for bh in 0..batch {
+        for mi in 0..m {
+            for ni in 0..n {
+                let base = bh * m * n;
+                _c[base + mi * n + ni] *= beta;
+                _c[base + mi * n + ni] += alpha
+                    * (0..k)
+                        .map(|ki| clip_a(bh, mi, ki) * clip_b(bh, ni, ki))
+                        .sum::<f32>();
             }
-
-            c_data[c_idx] = sum;
         }
     }
 }
@@ -201,7 +184,7 @@ pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
 }
 
 // Sample a index from a tensor (treated as a probability vector)
-#[warn(dead_code)]
+#[allow(dead_code)]
 pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) -> u32 {
     assert!(x.shape()[x.shape().len() - 1] == x.size());
     if temperature <= 0. || top_k < 2 || top_p <= 0. {
@@ -239,7 +222,7 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
         #[inline]
         fn from((i, p): (usize, &f32)) -> Self {
             Self {
-                val: p.clone(),
+                val: *p,
                 tok: i as _,
             }
         }

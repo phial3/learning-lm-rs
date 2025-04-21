@@ -7,17 +7,17 @@ pub struct Tensor<T> {
 }
 
 impl<T: Copy + Clone + Default> Tensor<T> {
-    pub fn new(data: Vec<T>, shape: &Vec<usize>) -> Self {
+    pub fn new(data: Vec<T>, shape: &[usize]) -> Self {
         let length = data.len();
         Tensor {
-            data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
-            shape: shape.clone(),
+            data: Arc::new(data.into_boxed_slice()),
+            shape: shape.to_owned(),
             offset: 0,
-            length: length,
+            length,
         }
     }
 
-    pub fn default(shape: &Vec<usize>) -> Self {
+    pub fn default(shape: &[usize]) -> Self {
         let length = shape.iter().product();
         let data = vec![T::default(); length];
         Self::new(data, shape)
@@ -51,18 +51,16 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         self
     }
 
-    pub fn slice(&self, start: usize, shape: &Vec<usize>) -> Self {
+    pub fn slice(&self, start: usize, shape: &[usize]) -> Self {
         let new_length: usize = shape.iter().product();
         assert!(self.offset + start + new_length <= self.length);
         Tensor {
             data: self.data.clone(),
-            shape: shape.clone(),
+            shape: shape.to_owned(),
             offset: self.offset + start,
             length: new_length,
         }
     }
-
-
 }
 
 // Some helper functions for testing and debugging
@@ -74,12 +72,15 @@ impl Tensor<f32> {
         }
         let a = self.data();
         let b = other.data();
-        
-        return a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel));
+
+        a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel))
     }
     #[allow(unused)]
-    pub fn print(&self){
-        println!("shpae: {:?}, offset: {}, length: {}", self.shape, self.offset, self.length);
+    pub fn print(&self) {
+        println!(
+            "shpae: {:?}, offset: {}, length: {}",
+            self.shape, self.offset, self.length
+        );
         let dim = self.shape()[self.shape().len() - 1];
         let batch = self.length / dim;
         for i in 0..batch {
