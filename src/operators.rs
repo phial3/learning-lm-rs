@@ -72,7 +72,11 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
     // 1. 检查输入的合法性
-    assert_eq!(x.shape(), y.shape(), "Input and output tensors must have the same shape");
+    assert_eq!(
+        x.shape(),
+        y.shape(),
+        "Input and output tensors must have the same shape"
+    );
     let x_shape = x.shape();
     assert!(!x_shape.is_empty(), "Input tensor cannot be empty");
 
@@ -80,7 +84,11 @@ pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: 
     let last_dim = *x_shape.last().unwrap();
 
     // 检查权重向量维度
-    assert_eq!(w.shape(), &vec![last_dim], "Weight tensor must match the last dimension");
+    assert_eq!(
+        w.shape(),
+        &vec![last_dim],
+        "Weight tensor must match the last dimension"
+    );
 
     // 2. 获取数据访问
     let x_data = x.data();
@@ -151,11 +159,15 @@ pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor
     assert_eq!(b_shape.len(), 2, "Matrix B must be 2-dimensional");
     assert_eq!(c_shape.len(), 2, "Matrix C must be 2-dimensional");
 
-    let (m, k) = (a_shape[0], a_shape[1]);   // A: m × k
+    let (m, k) = (a_shape[0], a_shape[1]); // A: m × k
     let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × b_k
 
     // 修改维度检查：A的列数(k)应该等于B的列数(b_k)
-    assert_eq!(k, b_k, "Inner dimensions must match for A @ B^T: A is {}×{}, B is {}×{}", m, k, n, b_k);
+    assert_eq!(
+        k, b_k,
+        "Inner dimensions must match for A @ B^T: A is {}×{}, B is {}×{}",
+        m, k, n, b_k
+    );
     assert_eq!(c_shape[0], m, "Output matrix C must have {} rows", m);
     assert_eq!(c_shape[1], n, "Output matrix C must have {} columns", n);
 
@@ -176,8 +188,8 @@ pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor
             // 计算 A @ B^T 的对应元素
             // C[i,j] = sum(A[i,k] * B[j,k]) 因为B是转置的
             for p in 0..k {
-                let a_idx = i * k + p;        // A[i,p]
-                let b_idx = j * b_k + p;      // B[j,p]
+                let a_idx = i * k + p; // A[i,p]
+                let b_idx = j * b_k + p; // B[j,p]
                 sum += alpha * a_data[a_idx] * b_data[b_idx];
             }
 
@@ -239,7 +251,7 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
         #[inline]
         fn from((i, p): (usize, &f32)) -> Self {
             Self {
-                val: p.clone(),
+                val: *p,
                 tok: i as _,
             }
         }

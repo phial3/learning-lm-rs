@@ -31,15 +31,21 @@ impl LLamaParams<f32> {
         // 辅助函数：从safetensors中加载张量
         let get_tensor = |name: &str| -> Tensor<f32> {
             // 获取张量数据和形状
-            let view = safetensor.tensor(name).unwrap_or_else(|_| {
-                panic!("Failed to load tensor: {}", name)
-            });
+            let view = safetensor
+                .tensor(name)
+                .unwrap_or_else(|_| panic!("Failed to load tensor: {}", name));
             let shape = view.shape().to_vec();
 
             // 获取数据
-            assert_eq!(view.dtype(), safetensors::Dtype::F32, "Only F32 dtype is supported for tensor: {}", name);
+            assert_eq!(
+                view.dtype(),
+                safetensors::Dtype::F32,
+                "Only F32 dtype is supported for tensor: {}",
+                name
+            );
 
-            let data: Vec<f32> = view.data()
+            let data: Vec<f32> = view
+                .data()
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .collect();
@@ -62,17 +68,44 @@ impl LLamaParams<f32> {
         // 加载每一层的参数
         for layer_idx in 0..num_layers {
             // Attention层参数
-            rms_att_w.push(get_tensor(&format!("model.layers.{}.input_layernorm.weight", layer_idx)));
-            wq.push(get_tensor(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx)));
-            wk.push(get_tensor(&format!("model.layers.{}.self_attn.k_proj.weight", layer_idx)));
-            wv.push(get_tensor(&format!("model.layers.{}.self_attn.v_proj.weight", layer_idx)));
-            wo.push(get_tensor(&format!("model.layers.{}.self_attn.o_proj.weight", layer_idx)));
+            rms_att_w.push(get_tensor(&format!(
+                "model.layers.{}.input_layernorm.weight",
+                layer_idx
+            )));
+            wq.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.q_proj.weight",
+                layer_idx
+            )));
+            wk.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.k_proj.weight",
+                layer_idx
+            )));
+            wv.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.v_proj.weight",
+                layer_idx
+            )));
+            wo.push(get_tensor(&format!(
+                "model.layers.{}.self_attn.o_proj.weight",
+                layer_idx
+            )));
 
             // FFN层参数
-            rms_ffn_w.push(get_tensor(&format!("model.layers.{}.post_attention_layernorm.weight", layer_idx)));
-            w_up.push(get_tensor(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx)));
-            w_gate.push(get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx)));
-            w_down.push(get_tensor(&format!("model.layers.{}.mlp.down_proj.weight", layer_idx)));
+            rms_ffn_w.push(get_tensor(&format!(
+                "model.layers.{}.post_attention_layernorm.weight",
+                layer_idx
+            )));
+            w_up.push(get_tensor(&format!(
+                "model.layers.{}.mlp.up_proj.weight",
+                layer_idx
+            )));
+            w_gate.push(get_tensor(&format!(
+                "model.layers.{}.mlp.gate_proj.weight",
+                layer_idx
+            )));
+            w_down.push(get_tensor(&format!(
+                "model.layers.{}.mlp.down_proj.weight",
+                layer_idx
+            )));
         }
 
         // 加载输出层参数

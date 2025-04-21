@@ -44,7 +44,7 @@ impl Llama<f32> {
             eps: config.rms_norm_eps,
             rope_theta: config.rope_theta,
             max_seq_len: config.max_position_embeddings,
-            params: params,
+            params,
             bos_token_id: config.bos_token_id,
             eos_token_id: config.eos_token_id,
         }
@@ -62,13 +62,13 @@ impl Llama<f32> {
         let n_groups = self.n_q_h / self.n_kv_h;
 
         // Some pre-allocated buffers that will be reused
-        let mut residual = Tensor::<f32>::default(&vec![seq_len, self.d]);
-        let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
-        let mut q_buf = Tensor::<f32>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
+        let mut residual = Tensor::<f32>::default(&[seq_len, self.d]);
+        let mut hidden_states = Tensor::<f32>::default(&[seq_len, self.d]);
+        let mut q_buf = Tensor::<f32>::default(&[seq_len, self.n_q_h * self.dqkv]);
         let mut att_scores =
-            Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
-        let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
-        let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
+            Tensor::<f32>::default(&[self.n_kv_h, n_groups, seq_len, total_seq_len]);
+        let mut gate_buf = Tensor::<f32>::default(&[seq_len, self.di]);
+        let mut up_buf = Tensor::<f32>::default(&[seq_len, self.di]);
 
         // Computation Starts Here
         // Embedding lookup
@@ -82,7 +82,7 @@ impl Llama<f32> {
                 self.eps,
             );
 
-            let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
+            let q = q_buf.reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
             let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
@@ -141,9 +141,9 @@ impl Llama<f32> {
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
-        let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
-        let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &vec![1, self.d]);
+        let mut logits = Tensor::<f32>::default(&[1, self.vocab]);
+        let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &[1, self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &[1, self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -164,27 +164,19 @@ impl Llama<f32> {
         top_p: f32,
         top_k: u32,
         temperature: f32,
-    ) -> Vec<u32>{
+    ) -> Vec<u32> {
         let mut result = token_ids.to_vec();
         let mut cache = self.new_cache();
 
         while result.len() < max_len {
             // Create input tensor from current sequence
-            let input = Tensor::new(
-                result.clone(),
-                &vec![result.len()],
-            );
+            let input = Tensor::new(result.clone(), &[result.len()]);
 
             // Forward pass to get logits
             let logits = self.forward(&input, &mut cache);
 
             // Sample next token using temperature, top_k, and top_p
-            let next_token = OP::random_sample(
-                &logits,
-                top_p,
-                top_k,
-                temperature,
-            );
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
 
             // Add token to result
             result.push(next_token);
@@ -199,6 +191,7 @@ impl Llama<f32> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn self_attention(
     hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
     att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
@@ -213,22 +206,16 @@ fn self_attention(
 ) {
     for h in 0..n_kv_h {
         // Get the keys for this head - slice with correct start index
-        let k_head = k.slice(h * dqkv, &vec![total_seq_len, dqkv]);
+        let k_head = k.slice(h * dqkv, &[total_seq_len, dqkv]);
 
         for g in 0..n_groups {
             // Get queries for this group with corrected slice index
-            let q_group = q.slice(
-                (h * n_groups + g) * dqkv,
-                &vec![seq_len, dqkv]
-            );
+            let q_group = q.slice((h * n_groups + g) * dqkv, &[seq_len, dqkv]);
 
             // Get scores buffer for this head and group
             let scores_per_group = seq_len * total_seq_len;
             let scores_start = h * n_groups * scores_per_group + g * scores_per_group;
-            let mut scores = att_scores.slice(
-                scores_start,
-                &vec![seq_len, total_seq_len]
-            );
+            let mut scores = att_scores.slice(scores_start, &[seq_len, total_seq_len]);
 
             // Compute Q * K^T
             unsafe {
@@ -251,11 +238,11 @@ fn self_attention(
             OP::masked_softmax(&mut scores);
 
             // Get values for this head
-            let v_head = v.slice(h * dqkv, &vec![total_seq_len, dqkv]);
+            let v_head = v.slice(h * dqkv, &[total_seq_len, dqkv]);
 
             // Compute attention output (scores * V)
             let out_offset = (h * n_groups + g) * dqkv;
-            let mut out = hidden_states.slice(0, &vec![seq_len, n_kv_h * n_groups * dqkv]);
+            let mut out = hidden_states.slice(0, &[seq_len, n_kv_h * n_groups * dqkv]);
 
             unsafe {
                 let out_data = out.data_mut();
@@ -277,6 +264,7 @@ fn self_attention(
 }
 
 /// 模型结构：Feed-Forward神经网络
+#[allow(clippy::too_many_arguments)]
 fn mlp(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
@@ -354,8 +342,8 @@ pub fn test_mlp() {
 
 #[test]
 pub fn test_load_safetensors() {
-    use std::path::PathBuf;
     use crate::tensor::float_eq;
+    use std::path::PathBuf;
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("story");
     let model = Llama::from_safetensors(model_dir);
@@ -367,17 +355,55 @@ pub fn test_load_safetensors() {
     assert_eq!(model.dqkv, 16);
     assert_eq!(model.di, 384);
 
-    assert!(float_eq(&model.params.embedding_table.data()[50], &0.14453125, 1e-6));
-    assert_eq!(model.params.lm_head.data()[10], model.params.embedding_table.data()[10]);
-    assert!(float_eq(&model.params.rms_att_w[0].data()[10], &0.18652344, 1e-6));
-    assert!(float_eq(&model.params.rms_ffn_w[1].data()[10], &0.32421875, 1e-6));
-    assert!(float_eq(&model.params.rms_out_w.data()[100], &0.73046875, 1e-6));
-    assert!(float_eq(&model.params.w_down[0].data()[100], &-0.0625, 1e-6));
+    assert!(float_eq(
+        &model.params.embedding_table.data()[50],
+        &0.14453125,
+        1e-6
+    ));
+    assert_eq!(
+        model.params.lm_head.data()[10],
+        model.params.embedding_table.data()[10]
+    );
+    assert!(float_eq(
+        &model.params.rms_att_w[0].data()[10],
+        &0.18652344,
+        1e-6
+    ));
+    assert!(float_eq(
+        &model.params.rms_ffn_w[1].data()[10],
+        &0.32421875,
+        1e-6
+    ));
+    assert!(float_eq(
+        &model.params.rms_out_w.data()[100],
+        &0.73046875,
+        1e-6
+    ));
+    assert!(float_eq(
+        &model.params.w_down[0].data()[100],
+        &-0.0625,
+        1e-6
+    ));
     assert!(float_eq(&model.params.w_up[0].data()[100], &1.46875, 1e-6));
-    assert!(float_eq(&model.params.w_gate[1].data()[100], &0.296875, 1e-6));
-    assert!(float_eq(&model.params.wq[1].data()[100], &0.032226563, 1e-6));
-    assert!(float_eq(&model.params.wk[1].data()[100], &-0.21386719, 1e-6));
-    assert!(float_eq(&model.params.wv[0].data()[100], &0.041015625, 1e-6));
+    assert!(float_eq(
+        &model.params.w_gate[1].data()[100],
+        &0.296875,
+        1e-6
+    ));
+    assert!(float_eq(
+        &model.params.wq[1].data()[100],
+        &0.032226563,
+        1e-6
+    ));
+    assert!(float_eq(
+        &model.params.wk[1].data()[100],
+        &-0.21386719,
+        1e-6
+    ));
+    assert!(float_eq(
+        &model.params.wv[0].data()[100],
+        &0.041015625,
+        1e-6
+    ));
     assert!(float_eq(&model.params.wo[0].data()[100], &0.01965332, 1e-6));
-
 }
