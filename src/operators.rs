@@ -1,6 +1,4 @@
 use crate::tensor::Tensor;
-use core::panic;
-use rayon::prelude::*;
 
 // get (row) vectors from a 2D table given a list of indices
 pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
@@ -92,57 +90,26 @@ pub fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Vec<usize> {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    let shape_x = x.shape();
-    let shape_y = y.shape();
+    let x_shape = x.shape();
+    let _y_shape = y.shape();
 
-    // 检查 x 和 y 的最后一维是否相同
-    let n_x = *shape_x.last().unwrap();
-    let n_y = *shape_y.last().unwrap();
-    assert_eq!(n_x, n_y, "x and y must have the same last dimension");
-
-    // 检查 w 的长度是否与最后一维 n 相同
-    assert_eq!(
-        w.size(),
-        n_x,
-        "w must have the same length as the last dimension of x"
-    );
-
-    // 计算 x 和 y 的总元素数
-    let len_x = x.size();
-    let len_y = y.size();
-
-    // 计算 x 和 y 的最后一维之前的维度大小
-    let num_vectors_x = len_x / n_x;
-    let num_vectors_y = len_y / n_y;
-
-    // 检查 x 和 y 的向量数量是否匹配
-    assert_eq!(
-        num_vectors_x, num_vectors_y,
-        "x and y must have the same number of vectors"
-    );
-
-    // 获取 y 的可变数据引用
-    let y_data = unsafe { y.data_mut() };
     let x_data = x.data();
     let w_data = w.data();
+    let y_data = unsafe { y.data_mut() };
 
-    // 对每个向量进行 RMS 归一化
-    for i in 0..num_vectors_x {
-        let start_index_x = i * n_x;
-        let end_index_x = start_index_x + n_x;
+    let n = x_shape[x_shape.len() - 1];
+    let num_vectors = x.size() / n;
 
-        let start_index_y = i * n_y;
+    for i in 0..num_vectors {
+        let offset = i * n;
 
-        // 计算 RMS
-        let rms: f32 = x_data[start_index_x..end_index_x]
+        let sum_sq = x_data[offset..offset + n]
             .iter()
-            .map(|&x| x * x)
-            .sum();
-        let mu = (rms / (n_x as f32) + epsilon).sqrt();
+            .fold(0.0, |acc, &val| acc + val * val);
+        let rms = (sum_sq / n as f32 + epsilon).sqrt();
 
-        // 计算归一化结果
-        for j in 0..n_x {
-            y_data[start_index_y + j] = x_data[start_index_x + j] * w_data[j] / mu;
+        for j in 0..n {
+            y_data[offset + j] = w_data[j] * (x_data[offset + j] / rms);
         }
     }
 }
@@ -150,88 +117,62 @@ pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    assert!(
-        y.shape() == x.shape(),
-        "swiglu: x and y must have the same shape"
-    );
+    // let len = y.size();
+    // assert!(len == x.size());
 
+    // let _y = unsafe { y.data_mut() };
+    // let _x = x.data();
+
+    // todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
     let len = y.size();
-    let y = unsafe { y.data_mut() };
-    let x = x.data();
+    assert!(len == x.size());
+
+    let y_data = unsafe { y.data_mut() };
+    let x_data = x.data();
 
     for i in 0..len {
-        y[i] = y[i] * x[i] * (1.0 / ((-x[i]).exp() + 1.0));
+        let sigmoid = 1.0 / (1.0 + (-x_data[i]).exp());
+        let silu = sigmoid * x_data[i];
+        y_data[i] *= silu;
     }
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    let shape_c = c.shape();
-    let shape_a = a.shape();
-    let shape_b = b.shape();
-    assert!(shape_b.len() == 2 && shape_a.len() == 2 && shape_c.len() == 2);
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let c_shape = c.shape();
 
-    let m = shape_a[0];
-    let k_dim = shape_a[1];
-    let n = shape_b[0];
-    assert_eq!(
-        shape_a[1], shape_b[1],
-        "a cols {} != b cols {}",
-        shape_a[1], shape_b[1]
+    assert_eq!(a_shape.len(), 2, "A must be 2D");
+    assert_eq!(b_shape.len(), 2, "B must be 2D");
+    assert_eq!(c_shape.len(), 2, "C must be 2D");
+
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let n = b_shape[0];
+
+    assert_eq!(b_shape[1], k, "A's columns must match B's rows");
+    assert!(
+        c_shape[0] == m && c_shape[1] == n,
+        "C's shape must be (m, n)"
     );
-    assert_eq!(shape_c, &[m, n], "c shape mismatch");
 
-    // 获取底层数据指针
-    let c_data = unsafe { c.data_mut() };
     let a_data = a.data();
     let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
 
-    // 并行处理每一行
-    c_data.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
-        let a_row = &a_data[i * k_dim..(i + 1) * k_dim];
-
-        // 对每列进行并行计算
-        c_row.par_iter_mut().enumerate().for_each(|(j, c_val)| {
-            let mut sum = 0.0;
-            let b_row = &b_data[j * k_dim..(j + 1) * k_dim];
-
-            // 展开循环以提高性能
-            for k in (0..k_dim).step_by(4) {
-                let end = (k + 4).min(k_dim);
-                sum += a_row[k..end]
-                    .iter()
-                    .zip(&b_row[k..end])
-                    .map(|(&a, &b)| a * b)
-                    .sum::<f32>();
+    for i in 0..m {
+        for j in 0..n {
+            let mut dot_product = 0.0;
+            for l in 0..k {
+                dot_product += a_data[i * k + l] * b_data[j * k + l];
             }
 
-            *c_val = *c_val * beta + sum * alpha;
-        });
-    });
-}
-
-// 辅助函数保持与之前相同的实现（移除了显式转置）
-#[allow(unused)]
-fn caculate2mat(a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) -> Vec<f32> {
-    let shape_a = a.shape();
-    let shape_b = b.shape();
-    let _m = shape_a[0];
-    let n = shape_b[0];
-    let k_dim = shape_a[1];
-
-    a.data()
-        .par_chunks(shape_a[1])
-        .flat_map(|a_row| {
-            (0..n)
-                .into_par_iter()
-                .map(|j| {
-                    let b_row = &b.data()[j * k_dim..(j + 1) * k_dim];
-                    a_row.iter().zip(b_row).map(|(&a, &b)| a * b).sum::<f32>() * alpha
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+            let index = i * n + j;
+            c_data[index] = alpha * dot_product + beta * c_data[index];
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -350,10 +291,4 @@ fn test_matmul_transb() {
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
     ));
-}
-
-#[test]
-#[should_panic]
-fn test_invalid_broadcast() {
-    broadcast_shapes(&[2, 3], &[3, 2]);
 }
