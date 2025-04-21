@@ -1,5 +1,4 @@
 use crate::tensor::Tensor;
-
 pub struct KVCache<T> {
     k_cache: Vec<Tensor<T>>, // (max_seq_len, n_kv_head * dqkv) x layers
     v_cache: Vec<Tensor<T>>, // (max_seq_len, n_kv_head * dqkv) x layers

@@ -61,6 +61,24 @@ impl<T: Copy + Clone + Default> Tensor<T> {
             length: new_length,
         }
     }
+
+    pub fn transpose(&self) -> Self {
+        let old_shape = self.shape().clone();
+        let (row, col) = (old_shape[0], old_shape[1]);
+        let shape = vec![col, row];
+        let mut data = vec![T::default(); row * col];
+        for i in 0..row {
+            for j in 0..col {
+                data[j * row + i] = self.data()[i * col + j];
+            }
+        }
+        Tensor {
+            data: Arc::new(data.into_boxed_slice()),
+            shape: shape.clone(),
+            offset: 0,
+            length: self.length,
+        }
+    }
 }
 
 // Some helper functions for testing and debugging
@@ -75,6 +93,22 @@ impl Tensor<f32> {
 
         a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel))
     }
+    #[allow(unused)]
+    pub fn print(&self) {
+        println!(
+            "shpae: {:?}, offset: {}, length: {}",
+            self.shape, self.offset, self.length
+        );
+        let dim = self.shape()[self.shape().len() - 1];
+        let batch = self.length / dim;
+        for i in 0..batch {
+            let start = i * dim;
+            println!("{:?}", &self.data()[start..][..dim]);
+        }
+    }
+}
+
+impl Tensor<u32> {
     #[allow(unused)]
     pub fn print(&self) {
         println!(
