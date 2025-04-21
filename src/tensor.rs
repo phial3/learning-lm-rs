@@ -1,15 +1,22 @@
+use half::f16;
 use std::{slice, sync::Arc, vec};
+
 pub struct Tensor<T> {
+    // Arc类似c++中的shared_ptr
+    // Box类似c++中的unique_ptr, 表示堆上的数据
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
-    offset: usize,
-    length: usize,
+    offset: usize, // offset为了实现slice服务
+    length: usize, // number of elements
 }
 
 impl<T: Copy + Clone + Default> Tensor<T> {
     pub fn new(data: Vec<T>, shape: &[usize]) -> Self {
         let length = data.len();
         Tensor {
+            // into_boxed_slice()将Vec<T>转换为Box<[T]>
+            // try_into()将Box<[T]>转换为Box<[T; N]>
+            // unwrap()Box<T>转换为T
             data: Arc::new(data.into_boxed_slice()),
             shape: shape.to_owned(),
             offset: 0,
@@ -73,9 +80,8 @@ impl Tensor<f32> {
         let a = self.data();
         let b = other.data();
 
-        a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel))
+        return a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel));
     }
-
     #[allow(unused)]
     pub fn print(&self) {
         println!(
@@ -88,6 +94,22 @@ impl Tensor<f32> {
             let start = i * dim;
             println!("{:?}", &self.data()[start..][..dim]);
         }
+    }
+}
+
+impl Tensor<f16> {
+    #[allow(unstable_features)]
+    pub fn to_f32(&self) -> Tensor<f32> {
+        let f32_data: Vec<f32> = self.data().iter().map(|x| x.to_f32()).collect();
+        Tensor::new(f32_data, &self.shape)
+    }
+}
+
+impl Tensor<f32> {
+    #[allow(unstable_features)]
+    pub fn to_f16(&self) -> Tensor<f16> {
+        let f16_data: Vec<f16> = self.data().iter().map(|x| f16::from_f32(*x)).collect();
+        Tensor::new(f16_data, &self.shape)
     }
 }
 

@@ -1,8 +1,19 @@
 use crate::tensor::Tensor;
-use core::panic;
-use rayon::prelude::*;
+
+#[cfg(feature = "gpu")]
+use crate::gpu::*; // 引入 GPU kernel 实现
 
 // get (row) vectors from a 2D table given a list of indices
+#[cfg(feature = "gpu")]
+pub fn gather<U: Copy + Default + cust::memory::DeviceCopy>(
+    y: &mut Tensor<f32>,
+    indices: &Tensor<u32>,
+    table: &Tensor<U>,
+) {
+    gather_kernel(y, indices, table).expect("GPU gather failed");
+}
+
+#[cfg(not(feature = "gpu"))]
 pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
     let length = indices.size();
     let table_shape = table.shape();
@@ -17,6 +28,12 @@ pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
 }
 
 // RoPE: Rotary Positional Embedding
+#[cfg(feature = "gpu")]
+pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
+    rope_kernel(y, start_pos, theta).expect("GPU rope failed");
+}
+
+#[cfg(not(feature = "gpu"))]
 pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
     let shape = y.shape();
     assert!(shape.len() == 3);
@@ -39,6 +56,12 @@ pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
     }
 }
 
+#[cfg(feature = "gpu")]
+pub fn masked_softmax(y: &mut Tensor<f32>) {
+    masked_softmax_kernel(y).expect("GPU masked_softmax failed");
+}
+
+#[cfg(not(feature = "gpu"))]
 // softmax(x) = exp(x - max) / sum(exp(x - max))
 // y = softmax(mask(x))
 pub fn masked_softmax(y: &mut Tensor<f32>) {
@@ -72,166 +95,186 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
     }
 }
 
-// shape boardcast
-pub fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Vec<usize> {
-    let len1 = shape1.len();
-    let len2 = shape2.len();
-    let max_len = len1.max(len2);
-    let mut shape = Vec::with_capacity(max_len);
-    // 逐个从后往前匹配维度
-    for i in 0..max_len {
-        let dim1 = if i < len1 { shape1[len1 - 1 - i] } else { 1 };
-        let dim2 = if i < len2 { shape2[len2 - 1 - i] } else { 1 };
-        // 维度要么相等，要么有一个是1，否则不能广播
-        if dim1 != dim2 && dim1 != 1 && dim2 != 1 {
-            panic!("Cannot broadcast shapes {:?} and {:?}", shape1, shape2);
-        }
-        shape[max_len - 1 - i] = dim1.max(dim2);
-    }
-    shape
+#[cfg(feature = "gpu")]
+pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
+    rms_norm_kernel(y, x, w, epsilon).expect("GPU rms_norm failed");
 }
 
+#[cfg(not(feature = "gpu"))]
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    let shape_x = x.shape();
-    let shape_y = y.shape();
+    // todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let len = y.size();
+    assert!(len == x.size());
+    assert!(w.shape().len() == 1); // w 是一个1D tensor
+    let n = x.shape()[x.shape().len() - 1];
+    assert!(w.size() == n); // w 的长度等于 x 的最后一个维度的长度
 
-    // 检查 x 和 y 的最后一维是否相同
-    let n_x = *shape_x.last().unwrap();
-    let n_y = *shape_y.last().unwrap();
-    assert_eq!(n_x, n_y, "x and y must have the same last dimension");
+    let _y = unsafe { y.data_mut() }; // y原来的data无所谓
+    let _x = x.data();
+    let _w = w.data();
 
-    // 检查 w 的长度是否与最后一维 n 相同
-    assert_eq!(
-        w.size(),
-        n_x,
-        "w must have the same length as the last dimension of x"
-    );
-
-    // 计算 x 和 y 的总元素数
-    let len_x = x.size();
-    let len_y = y.size();
-
-    // 计算 x 和 y 的最后一维之前的维度大小
-    let num_vectors_x = len_x / n_x;
-    let num_vectors_y = len_y / n_y;
-
-    // 检查 x 和 y 的向量数量是否匹配
-    assert_eq!(
-        num_vectors_x, num_vectors_y,
-        "x and y must have the same number of vectors"
-    );
-
-    // 获取 y 的可变数据引用
-    let y_data = unsafe { y.data_mut() };
-    let x_data = x.data();
-    let w_data = w.data();
-
-    // 对每个向量进行 RMS 归一化
-    for i in 0..num_vectors_x {
-        let start_index_x = i * n_x;
-        let end_index_x = start_index_x + n_x;
-
-        let start_index_y = i * n_y;
-
-        // 计算 RMS
-        let rms: f32 = x_data[start_index_x..end_index_x]
-            .iter()
-            .map(|&x| x * x)
-            .sum();
-        let mu = (rms / (n_x as f32) + epsilon).sqrt();
-
-        // 计算归一化结果
-        for j in 0..n_x {
-            y_data[start_index_y + j] = x_data[start_index_x + j] * w_data[j] / mu;
+    // rms
+    // 这里只考虑对最后一个维度进行归一化
+    for i in 0..x.size() / n {
+        let mut sum = 0.0;
+        for j in 0..n {
+            sum += _x[i * n + j].powi(2);
+        }
+        sum = (sum / n as f32 + epsilon).sqrt();
+        for j in 0..n {
+            _y[i * n + j] = _x[i * n + j] / sum * _w[j];
         }
     }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
+#[cfg(feature = "gpu")]
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    assert!(
-        y.shape() == x.shape(),
-        "swiglu: x and y must have the same shape"
-    );
+    // 调用 GPU 实现，GPU kernel 内部将完成 element-wise 计算
+    swiglu_kernel(y, x).expect("GPU swiglu failed");
+}
 
+#[cfg(not(feature = "gpu"))]
+pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
     let len = y.size();
-    let y = unsafe { y.data_mut() };
-    let x = x.data();
+    assert!(len == x.size());
 
-    for i in 0..len {
-        y[i] = y[i] * x[i] * (1.0 / ((-x[i]).exp() + 1.0));
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+
+    // 首先要实现一个sigmoid
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
     }
+    _y.iter_mut().zip(_x).for_each(|(y, x)| {
+        // silu(x) = x * sigmoid(x)
+        *y *= x * sigmoid(*x);
+    });
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
-pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    let shape_c = c.shape();
-    let shape_a = a.shape();
-    let shape_b = b.shape();
-    assert!(shape_b.len() == 2 && shape_a.len() == 2 && shape_c.len() == 2);
-
-    let m = shape_a[0];
-    let k_dim = shape_a[1];
-    let n = shape_b[0];
-    assert_eq!(
-        shape_a[1], shape_b[1],
-        "a cols {} != b cols {}",
-        shape_a[1], shape_b[1]
-    );
-    assert_eq!(shape_c, &[m, n], "c shape mismatch");
-
-    // 获取底层数据指针
-    let c_data = unsafe { c.data_mut() };
-    let a_data = a.data();
-    let b_data = b.data();
-
-    // 并行处理每一行
-    c_data.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
-        let a_row = &a_data[i * k_dim..(i + 1) * k_dim];
-
-        // 对每列进行并行计算
-        c_row.par_iter_mut().enumerate().for_each(|(j, c_val)| {
-            let mut sum = 0.0;
-            let b_row = &b_data[j * k_dim..(j + 1) * k_dim];
-
-            // 展开循环以提高性能
-            for k in (0..k_dim).step_by(4) {
-                let end = (k + 4).min(k_dim);
-                sum += a_row[k..end]
-                    .iter()
-                    .zip(&b_row[k..end])
-                    .map(|(&a, &b)| a * b)
-                    .sum::<f32>();
-            }
-
-            *c_val = *c_val * beta + sum * alpha;
-        });
-    });
+// 这里matmul分为三个版本
+// 1. 通用版本，不考虑任何优化, 无gpu标记时编译, 并且非x86_64平台下编译
+// 2. 使用SIMD加速的版本, 只有无gpu标记，并且在x86_64平台下才会编译
+// 3. 使用GPU加速的版本, 有gpu标记时编译
+#[cfg(feature = "gpu")]
+pub fn matmul_transb<U: Copy + Default + Sync + cust::memory::DeviceCopy>(
+    c: &mut Tensor<f32>,
+    beta: f32,
+    a: &Tensor<f32>,
+    b: &Tensor<U>,
+    alpha: f32,
+) {
+    // 调用 GPU 实现，可以使用 cuBLAS 等库来完成矩阵乘法
+    matmul_transb_kernel(c, beta, a, b, alpha).expect("GPU matmul_transb failed");
 }
 
-// 辅助函数保持与之前相同的实现（移除了显式转置）
-#[allow(unused)]
-fn caculate2mat(a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) -> Vec<f32> {
-    let shape_a = a.shape();
-    let shape_b = b.shape();
-    let _m = shape_a[0];
-    let n = shape_b[0];
-    let k_dim = shape_a[1];
+// https://doc.rust-lang.org/core/arch/index.html
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
+unsafe fn matmul_f32_avx2(
+    c: &mut Tensor<f32>,
+    beta: f32,
+    a: &Tensor<f32>,
+    b: &Tensor<f32>,
+    alpha: f32,
+) {
+    let a_shape = a.shape(); // (m, k)
+    let b_shape = b.shape(); // (n, k)
+    let _a = a.data();
+    let _b = b.data();
+    let _c = unsafe { c.data_mut() };
+    let (i, j, k) = (a_shape[0], b_shape[0], a_shape[1]);
+    for x in 0..i {
+        for y in 0..j {
+            let mut sum_vec = _mm256_setzero_ps();
+            for z in (0..k).step_by(8) {
+                let a_vec = _mm256_loadu_ps(_a.as_ptr().add(x * k + z));
+                let b_vec = _mm256_loadu_ps(_b.as_ptr().add(y * k + z));
+                sum_vec = _mm256_fmadd_ps(a_vec, b_vec, sum_vec);
+            }
+            let mut sum_arr = [0.0; 8];
+            _mm256_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let sum = sum_arr.iter().sum::<f32>();
 
-    a.data()
-        .par_chunks(shape_a[1])
-        .flat_map(|a_row| {
-            (0..n)
-                .into_par_iter()
-                .map(|j| {
-                    let b_row = &b.data()[j * k_dim..(j + 1) * k_dim];
-                    a_row.iter().zip(b_row).map(|(&a, &b)| a * b).sum::<f32>() * alpha
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+            _c[x * j + y] *= beta;
+            _c[x * j + y] += alpha * sum;
+        }
+    }
+}
+#[cfg(all(target_arch = "x86_64", not(feature = "gpu")))]
+pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
+    // 作业部分先只考虑二维矩阵
+    // 并且暂时不考虑broadcasting
+    let c_shape = c.shape(); // (m, n)
+    let a_shape = a.shape(); // (m, k)
+    let b_shape = b.shape(); // (n, k)
+    assert!(c_shape.len() == 2);
+    assert!(a_shape.len() == 2);
+    assert!(b_shape.len() == 2);
+    assert!(c_shape[0] == a_shape[0]);
+    assert!(c_shape[1] == b_shape[0]);
+    assert!(a_shape[1] == b_shape[1]);
+
+    let m = c_shape[0];
+    let n = c_shape[1];
+    let k = a_shape[1];
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
+    if is_x86_feature_detected!("avx2") && k % 8 == 0 {
+        unsafe {
+            matmul_f32_avx2(c, beta, a, b, alpha);
+        }
+    } else {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for l in 0..k {
+                    // a[i][l]
+                    // bT[l][j] = b[j][l]
+                    sum += a_data[i * k + l] * b_data[j * k + l];
+                }
+                c_data[i * n + j] = beta * c_data[i * n + j] + alpha * sum;
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "gpu")))]
+pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
+    // 作业部分先只考虑二维矩阵
+    // 并且暂时不考虑broadcasting
+    let c_shape = c.shape(); // (m, n)
+    let a_shape = a.shape(); // (m, k)
+    let b_shape = b.shape(); // (n, k)
+    assert!(c_shape.len() == 2);
+    assert!(a_shape.len() == 2);
+    assert!(b_shape.len() == 2);
+    assert!(c_shape[0] == a_shape[0]);
+    assert!(c_shape[1] == b_shape[0]);
+    assert!(a_shape[1] == b_shape[1]);
+
+    let m = c_shape[0];
+    let n = c_shape[1];
+    let k = a_shape[1];
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for l in 0..k {
+                // a[i][l]
+                // bT[l][j] = b[j][l]
+                sum += a_data[i * k + l] * b_data[j * k + l];
+            }
+            c_data[i * n + j] = beta * c_data[i * n + j] + alpha * sum;
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -286,7 +329,7 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
         #[inline]
         fn from((i, p): (usize, &f32)) -> Self {
             Self {
-                val: *p,
+                val: p.clone(),
                 tok: i as _,
             }
         }
@@ -350,10 +393,4 @@ fn test_matmul_transb() {
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
     ));
-}
-
-#[test]
-#[should_panic]
-fn test_invalid_broadcast() {
-    broadcast_shapes(&[2, 3], &[3, 2]);
 }

@@ -1,16 +1,18 @@
 use crate::config::LlamaConfigJson;
 use crate::tensor::Tensor;
-use safetensors::SafeTensors;
+use half::f16;
+use safetensors::{tensor, SafeTensors};
+use std::slice;
 
 pub struct LLamaParams<T> {
     // token_id to embedding lookup table
     pub embedding_table: Tensor<T>, // (vocab_size, dim)
     // decoder layer
-    pub rms_att_w: Vec<Tensor<T>>, // (hidden_size, ) x layers
-    pub wq: Vec<Tensor<T>>,        // (n_heads * head_size, hidden_size) x layers
-    pub wk: Vec<Tensor<T>>,        // (n_kv_heads * head_size, hidden_size) x layers
-    pub wv: Vec<Tensor<T>>,        // (n_kv_heads * head_size, hidden_size) x layers
-    pub wo: Vec<Tensor<T>>,        // (hidden_size, n_heads * head_size) x layers
+    pub rms_att_w: Vec<Tensor<T>>, // (hidden_size, ) x layers 注意很多权重是以转制的形式存储的
+    pub wq: Vec<Tensor<T>>, // (n_heads * head_size, hidden_size) x layers 注意这里Q的头可能是KV的整数倍, 因为用的是GHQ
+    pub wk: Vec<Tensor<T>>, // (n_kv_heads * head_size, hidden_size) x layers
+    pub wv: Vec<Tensor<T>>, // (n_kv_heads * head_size, hidden_size) x layers
+    pub wo: Vec<Tensor<T>>, // (hidden_size, n_heads * head_size) x layers
     // ffn layer
     pub rms_ffn_w: Vec<Tensor<T>>, // (hidden_size, ) x layers
     pub w_up: Vec<Tensor<T>>,      // (intermediate_size, hidden_size) x layers
@@ -22,68 +24,122 @@ pub struct LLamaParams<T> {
 }
 
 impl LLamaParams<f32> {
-    // Helper function to convert u8 slice to f32 vector
-    fn u8_to_f32_vec(data: &[u8]) -> Vec<f32> {
-        // 检查数据长度是否是4的倍数
-        assert!(
-            data.len() % 4 == 0,
-            "Input &[u8] length must be a multiple of 4"
-        );
-
-        // 每4字节解析为一个f32
-        data.chunks(4)
-            .map(|chunk| {
-                let bytes: [u8; 4] = chunk.try_into().expect("Chunk size should be 4");
-                f32::from_le_bytes(bytes) // 假设数据是小端序（LE）
-            })
-            .collect()
-    }
-
     pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson) -> Self {
-        // 首先打印所有可用的张量名称，帮助调试
-        println!("Available tensors:");
-        for name in safetensor.names() {
-            println!("  {}", name);
-        }
-        println!("-----------");
-        
-        // Helper closure to load a tensor by name
+        let layers = config.num_hidden_layers;
         let get_tensor = |name: &str| {
-            let tensor_data = safetensor
-                .tensor(name)
-                .unwrap_or_else(|_| panic!("Tensor {name} not found in safetensors file"));
-            let shape = tensor_data
-                .shape()
-                .to_vec();
-            let float_data = Self::u8_to_f32_vec(tensor_data.data());
-            //println!("get the tensor {} successfully", name);
-            Tensor::new(float_data, &shape)
+            match safetensor.tensor(name) {
+                Ok(tensor_view) => {
+                    // 注意这里获取length和转换为f32的方式
+                    // 这里是真的不会，对rust不熟，参考了一个大佬的实现
+                    let p: usize = tensor_view.shape().iter().product();
+                    let new_data = unsafe {
+                        slice::from_raw_parts(tensor_view.data().as_ptr() as *const f32, p)
+                    };
+                    Tensor::new(Vec::from(new_data), &tensor_view.shape().to_vec())
+                }
+                Err(err) => panic!("{}", err),
+            }
         };
 
-        // Helper function to load a vector of tensors for each layer
-        let load_layers = |prefix: &str, layers: usize| -> Vec<Tensor<f32>> {
-            (0..layers)
-                .map(|i| get_tensor(&format!("model.layers.{}.{}", i, prefix)))
-                .collect()
-        };
-
-        // Construct LLamaParams using get_tensor and load_layers
         LLamaParams {
-            //embedding_table: get_tensor("lm_head.weight"), // 不是很理解
+            // tie_word_embeddings = true
+            // 注意，如果tie_word_embeddings为true，那么embedding_table和lm_head是同一个
+            // chat模型里不是共用的
             embedding_table: if config.tie_word_embeddings {
                 get_tensor("lm_head.weight")
             } else {
-                get_tensor("model.embed_tokens.weight")
+                get_tensor("model.embed_tokens.weight") // chat模型中的
             },
-            rms_att_w: load_layers("input_layernorm.weight", config.num_hidden_layers),
-            wq: load_layers("self_attn.q_proj.weight", config.num_hidden_layers),
-            wk: load_layers("self_attn.k_proj.weight", config.num_hidden_layers),
-            wv: load_layers("self_attn.v_proj.weight", config.num_hidden_layers),
-            wo: load_layers("self_attn.o_proj.weight", config.num_hidden_layers),
-            rms_ffn_w: load_layers("post_attention_layernorm.weight", config.num_hidden_layers),
-            w_up: load_layers("mlp.up_proj.weight", config.num_hidden_layers),
-            w_gate: load_layers("mlp.gate_proj.weight", config.num_hidden_layers),
-            w_down: load_layers("mlp.down_proj.weight", config.num_hidden_layers),
+
+            rms_att_w: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.input_layernorm.weight")))
+                .collect(),
+            wq: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.q_proj.weight")))
+                .collect(),
+            wk: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.k_proj.weight")))
+                .collect(),
+            wv: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.v_proj.weight")))
+                .collect(),
+            wo: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.o_proj.weight")))
+                .collect(),
+
+            rms_ffn_w: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.post_attention_layernorm.weight")))
+                .collect(),
+            w_up: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.up_proj.weight")))
+                .collect(),
+            w_gate: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.gate_proj.weight")))
+                .collect(),
+            w_down: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.down_proj.weight")))
+                .collect(),
+
+            rms_out_w: get_tensor("model.norm.weight"),
+            lm_head: get_tensor("lm_head.weight"),
+        }
+    }
+}
+
+impl LLamaParams<f16> {
+    #[allow(unstable_features)]
+    pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson) -> Self {
+        let layers = config.num_hidden_layers;
+        let get_tensor = |name: &str| {
+            match safetensor.tensor(name) {
+                Ok(tensor_view) => {
+                    // 注意这里获取length和转换为f16的方式
+                    let p: usize = tensor_view.shape().iter().product();
+                    let new_data = unsafe {
+                        slice::from_raw_parts(tensor_view.data().as_ptr() as *const f16, p)
+                    };
+                    Tensor::new(Vec::from(new_data), &tensor_view.shape().to_vec())
+                }
+                Err(err) => panic!("{}", err),
+            }
+        };
+
+        LLamaParams {
+            embedding_table: if config.tie_word_embeddings {
+                get_tensor("lm_head.weight")
+            } else {
+                get_tensor("model.embed_tokens.weight") // chat模型中的
+            },
+
+            rms_att_w: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.input_layernorm.weight")))
+                .collect(),
+            wq: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.q_proj.weight")))
+                .collect(),
+            wk: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.k_proj.weight")))
+                .collect(),
+            wv: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.v_proj.weight")))
+                .collect(),
+            wo: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.o_proj.weight")))
+                .collect(),
+
+            rms_ffn_w: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.post_attention_layernorm.weight")))
+                .collect(),
+            w_up: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.up_proj.weight")))
+                .collect(),
+            w_gate: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.gate_proj.weight")))
+                .collect(),
+            w_down: (0..layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.down_proj.weight")))
+                .collect(),
+
             rms_out_w: get_tensor("model.norm.weight"),
             lm_head: get_tensor("lm_head.weight"),
         }
