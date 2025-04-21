@@ -5,9 +5,12 @@ use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators as OP;
 use crate::params::LLamaParams;
+use crate::tensor::DType;
 use crate::tensor::Tensor;
+
 use safetensors::SafeTensors;
 use std::path::Path;
+use tokenizers::Tokenizer;
 
 pub struct Llama<T> {
     vocab: usize,           // vocab size
@@ -26,7 +29,47 @@ pub struct Llama<T> {
 }
 
 impl Llama<f32> {
+    pub fn chat(
+        &self,
+        user_input: &str,
+        tokenizer: &Tokenizer,
+        history: &mut Vec<(String, String)>,
+        _cache: &mut KVCache<f32>,
+    ) -> String {
+        // 2. 组织对话上下文
+        let mut prompt = String::new();
+        for (user, assistant) in history.iter() {
+            prompt.push_str(&format!("<|im_start|>user\n{}\n<|im_end|>\n", user));
+            prompt.push_str(&format!(
+                "<|im_start|>assistant\n{}\n<|im_end|>\n",
+                assistant
+            ));
+        }
+        prompt.push_str(&format!("<|im_start|>user\n{}\n<|im_end|>\n", user_input));
+        prompt.push_str("<|im_start|>assistant\n"); // 让模型开始回答
+
+        // 3. 使用 Tokenizer 编码
+        let encoded = tokenizer.encode(prompt.as_str(), true).unwrap();
+        let input_ids = encoded.get_ids();
+
+        // 4. 调用 `generate`，保持原来的生成参数
+        let output_ids = self.generate(input_ids, 500, 0.8, 30, 1.0); // 保持原参数
+
+        // 5. 解码 token ID
+        let output_text = tokenizer.decode(&output_ids, true).unwrap();
+
+        // 6. 处理生成结果，去掉特殊标记，并修整输出
+        let output_text = output_text.replace("<|end_story|>", "").trim().to_string();
+
+        // 7. 记录对话历史
+        history.push((user_input.to_string(), output_text.clone()));
+
+        // 返回生成的文本
+        output_text
+    }
+
     pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
+        // println!("Trying to open: {:?}", model_dir.as_ref().join("config.json"));
         let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
         let config: LlamaConfigJson = serde_json::from_reader(config).unwrap();
         let model_file = std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
@@ -72,7 +115,12 @@ impl Llama<f32> {
 
         // Computation Starts Here
         // Embedding lookup
-        OP::gather(&mut residual, input, &self.params.embedding_table);
+
+        // 将embedding_table存储为fp16
+        let table_f16 = self.params.embedding_table.to_dtype(DType::F16);
+        OP::gather(&mut residual, input, &table_f16);
+
+        // OP::gather(&mut residual, input, &self.params.embedding_table);
 
         for layer in 0..self.n_layers {
             OP::rms_norm(
@@ -102,7 +150,8 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            // Implement self-attention
+            // todo!("self_attention(...)");
+            // todo!("down_proj matmul and add residual");
             self_attention(
                 &mut hidden_states,
                 &mut att_scores,
@@ -116,16 +165,14 @@ impl Llama<f32> {
                 self.dqkv,
             );
 
-            // Down projection and residual connection
             OP::matmul_transb(
                 &mut residual,
-                0.0,
+                1.0,
                 &hidden_states,
                 &self.params.wo[layer],
                 1.0,
             );
 
-            // MLP layer
             mlp(
                 &mut residual,
                 &mut hidden_states,
@@ -137,13 +184,15 @@ impl Llama<f32> {
                 &self.params.rms_ffn_w[layer],
                 self.eps,
             );
+
+            // todo!("mlp(...)");
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
         let mut logits = Tensor::<f32>::default(&[1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &[1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &[1, self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &[self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -165,28 +214,19 @@ impl Llama<f32> {
         top_k: u32,
         temperature: f32,
     ) -> Vec<u32> {
-        let mut result = token_ids.to_vec();
+        // todo!("实现文本生成");
+        let mut result = Vec::<u32>::new();
         let mut cache = self.new_cache();
-
+        let mut prompt = Tensor::new(token_ids.to_vec(), &[token_ids.len()]);
         while result.len() < max_len {
-            // Create input tensor from current sequence
-            let input = Tensor::new(result.clone(), &[result.len()]);
-
-            // Forward pass to get logits
-            let logits = self.forward(&input, &mut cache);
-
-            // Sample next token using temperature, top_k, and top_p
-            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
-
-            // Add token to result
-            result.push(next_token);
-
-            // Check for EOS token
-            if next_token == self.eos_token_id {
+            let logits = self.forward(&prompt, &mut cache);
+            let token_id = OP::random_sample(&logits, top_p, top_k, temperature);
+            if token_id == self.eos_token_id {
                 break;
             }
+            result.push(token_id);
+            prompt = Tensor::new(vec![token_id], &[1]);
         }
-
         result
     }
 }
@@ -198,72 +238,72 @@ fn self_attention(
     q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
     k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
     v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    n_kv_h: usize,                   // number of key/value heads
-    n_groups: usize,                 // number of query groups per k/v head
-    seq_len: usize,                  // length of current sequence
-    total_seq_len: usize,            // total sequence length including past
-    dqkv: usize,                     // dimension of keys/values per head
+    n_kv_h: usize,
+    n_groups: usize,
+    seq_len: usize,
+    total_seq_len: usize,
+    dqkv: usize,
 ) {
-    for h in 0..n_kv_h {
-        // Get the keys for this head - slice with correct start index
-        let k_head = k.slice(h * dqkv, &[total_seq_len, dqkv]);
+    // todo!("Implement self_attention");
+    let scale = (dqkv as f32).sqrt();
+    let q_data = q.data();
+    let k_data = k.data();
+    let v_data = v.data();
+    let att_data = unsafe { att_scores.data_mut() };
 
-        for g in 0..n_groups {
-            // Get queries for this group with corrected slice index
-            let q_group = q.slice((h * n_groups + g) * dqkv, &[seq_len, dqkv]);
-
-            // Get scores buffer for this head and group
-            let scores_per_group = seq_len * total_seq_len;
-            let scores_start = h * n_groups * scores_per_group + g * scores_per_group;
-            let mut scores = att_scores.slice(scores_start, &[seq_len, total_seq_len]);
-
-            // Compute Q * K^T
-            unsafe {
-                let scores_data = scores.data_mut();
-                let q_data = q_group.data();
-                let k_data = k_head.data();
-
-                for i in 0..seq_len {
-                    for j in 0..total_seq_len {
-                        let mut sum = 0.0;
-                        for d in 0..dqkv {
-                            sum += q_data[i * dqkv + d] * k_data[j * dqkv + d];
-                        }
-                        scores_data[i * total_seq_len + j] = sum / (dqkv as f32).sqrt();
+    for kv_head in 0..n_kv_h {
+        for group in 0..n_groups {
+            for q_seq in 0..seq_len {
+                for k_seq in 0..total_seq_len {
+                    let mut dot_product = 0.0;
+                    for d in 0..dqkv {
+                        let q_idx = q_seq * (n_kv_h * n_groups * dqkv)
+                            + (kv_head * n_groups + group) * dqkv
+                            + d;
+                        let k_idx = k_seq * (n_kv_h * dqkv) + kv_head * dqkv + d;
+                        dot_product += q_data[q_idx] * k_data[k_idx];
                     }
+                    let score_idx = kv_head * (n_groups * seq_len * total_seq_len)
+                        + group * (seq_len * total_seq_len)
+                        + q_seq * total_seq_len
+                        + k_seq;
+                    att_data[score_idx] = dot_product / scale;
                 }
             }
+        }
+    }
 
-            // Apply softmax to scores
-            OP::masked_softmax(&mut scores);
+    OP::masked_softmax(att_scores);
 
-            // Get values for this head
-            let v_head = v.slice(h * dqkv, &[total_seq_len, dqkv]);
+    let att_data = att_scores.data();
+    let hidden_data = unsafe { hidden_states.data_mut() };
+    for i in 0..hidden_data.len() {
+        hidden_data[i] = 0.0;
+    }
 
-            // Compute attention output (scores * V)
-            let out_offset = (h * n_groups + g) * dqkv;
-            let mut out = hidden_states.slice(0, &[seq_len, n_kv_h * n_groups * dqkv]);
-
-            unsafe {
-                let out_data = out.data_mut();
-                let scores_data = scores.data();
-                let v_data = v_head.data();
-
-                for i in 0..seq_len {
-                    for d in 0..dqkv {
-                        let mut sum = 0.0;
-                        for j in 0..total_seq_len {
-                            sum += scores_data[i * total_seq_len + j] * v_data[j * dqkv + d];
-                        }
-                        out_data[i * (n_kv_h * n_groups * dqkv) + out_offset + d] = sum;
+    for kv_head in 0..n_kv_h {
+        for group in 0..n_groups {
+            for q_seq in 0..seq_len {
+                for d in 0..dqkv {
+                    let mut sum = 0.0;
+                    for k_seq in 0..total_seq_len {
+                        let score_idx = kv_head * (n_groups * seq_len * total_seq_len)
+                            + group * (seq_len * total_seq_len)
+                            + q_seq * total_seq_len
+                            + k_seq;
+                        let v_idx = k_seq * (n_kv_h * dqkv) + kv_head * dqkv + d;
+                        sum += att_data[score_idx] * v_data[v_idx];
                     }
+                    let out_idx = q_seq * (n_kv_h * n_groups * dqkv)
+                        + (kv_head * n_groups + group) * dqkv
+                        + d;
+                    hidden_data[out_idx] = sum;
                 }
             }
         }
     }
 }
 
-/// 模型结构：Feed-Forward神经网络
 #[allow(clippy::too_many_arguments)]
 fn mlp(
     residual: &mut Tensor<f32>,
@@ -276,30 +316,12 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    // 1. hidden = rms_norm(residual)
+    // todo!("Implement mlp");
     OP::rms_norm(hidden_states, residual, rms_w, eps);
-
-    // 2. gate = hidden @ gate_weight.T
-    // 3. up = hidden @ up_weight.T
-    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
-    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0);
-
-    // 4. act = gate * sigmoid(gate) * up  (SwiGLU activation)
+    OP::matmul_transb(gate, 0., hidden_states, w_gate, 1.0);
+    OP::matmul_transb(up, 0., hidden_states, w_up, 1.0);
     OP::swiglu(up, gate);
-
-    // 5. output = act @ down_weight.T
-    // 结果直接存储在 residual 中，复用内存
-    OP::matmul_transb(residual, 0.0, up, w_down, 1.0);
-
-    // 6. residual = output + residual
-    // 在获取可变引用前先获取大小
-    let residual_size = residual.size();
-    let residual_data = unsafe { residual.data_mut() };
-    let hidden_data = hidden_states.data();
-
-    for i in 0..residual_size {
-        residual_data[i] += hidden_data[i];
-    }
+    OP::matmul_transb(residual, 1.0, up, w_down, 1.0);
 }
 
 #[test]

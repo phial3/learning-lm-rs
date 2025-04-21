@@ -1,9 +1,37 @@
 use std::{slice, sync::Arc, vec};
+// 新增在 tensor.rs 顶部
+use half::f16;
+#[derive(Debug, Clone, Copy)]
+pub enum DType {
+    F16,
+    F32,
+}
+
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
     offset: usize,
     length: usize,
+}
+
+impl<T: Copy + Clone + Default + Into<f32>> Tensor<T> {
+    pub fn to_dtype(&self, dtype: DType) -> Tensor<f32> {
+        match dtype {
+            DType::F16 => {
+                let converted: Vec<f16> = self
+                    .data()
+                    .iter()
+                    .map(|x| f16::from_f32((*x).into()))
+                    .collect();
+                let f32_data: Vec<f32> = converted.iter().map(|x| x.to_f32()).collect();
+                Tensor::new(f32_data, &self.shape)
+            }
+            DType::F32 => Tensor::new(
+                self.data().iter().map(|x| (*x).into()).collect(),
+                &self.shape,
+            ),
+        }
+    }
 }
 
 impl<T: Copy + Clone + Default> Tensor<T> {
@@ -24,6 +52,7 @@ impl<T: Copy + Clone + Default> Tensor<T> {
     }
 
     pub fn data(&self) -> &[T] {
+        //? 等价于self.data[self.offset:self.offset + self.length]
         &self.data[self.offset..][..self.length]
     }
 
