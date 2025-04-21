@@ -10,4 +10,3 @@ safetensors = "0.5"
 tokenizers = "0.21"
 rand = "0.8"
 eframe = { version = "0.31", features = ["persistence"] }
-tokio = { version = "1.44", features = ["full"] }
