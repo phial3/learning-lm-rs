@@ -75,6 +75,7 @@ impl Tensor<f32> {
 
         a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel))
     }
+
     #[allow(unused)]
     pub fn print(&self) {
         println!(

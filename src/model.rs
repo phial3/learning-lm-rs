@@ -6,6 +6,7 @@ use crate::kvcache::KVCache;
 use crate::operators as OP;
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
+use rayon::prelude::*;
 use safetensors::SafeTensors;
 use std::path::Path;
 
@@ -101,8 +102,7 @@ impl Llama<f32> {
 
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
-
-            // Implement self-attention
+                                                       //multi-self-attention
             self_attention(
                 &mut hidden_states,
                 &mut att_scores,
@@ -115,17 +115,15 @@ impl Llama<f32> {
                 total_seq_len,
                 self.dqkv,
             );
-
-            // Down projection and residual connection
+            // down project
             OP::matmul_transb(
                 &mut residual,
-                0.0,
+                1.0,
                 &hidden_states,
                 &self.params.wo[layer],
                 1.0,
             );
-
-            // MLP layer
+            //mlp
             mlp(
                 &mut residual,
                 &mut hidden_states,
@@ -143,7 +141,7 @@ impl Llama<f32> {
         // which contains the probabilities for the next token.
         let mut logits = Tensor::<f32>::default(&[1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &[1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &[1, self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &[self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -164,27 +162,28 @@ impl Llama<f32> {
         top_p: f32,
         top_k: u32,
         temperature: f32,
+        cache: &mut KVCache<f32>,
     ) -> Vec<u32> {
-        let mut result = token_ids.to_vec();
-        let mut cache = self.new_cache();
+        let mut result = Vec::<u32>::new();
 
-        while result.len() < max_len {
-            // Create input tensor from current sequence
-            let input = Tensor::new(result.clone(), &[result.len()]);
+        // 将输入的 token_ids 转换为 Tensor
+        let mut input_tensor = Tensor::<u32>::new(token_ids.to_vec(), &[token_ids.len()]);
 
-            // Forward pass to get logits
-            let logits = self.forward(&input, &mut cache);
+        // 按照最大长度生成结果
+        for _ in 0..max_len {
+            // 前向传播，获取 logits
+            let logits = self.forward(&input_tensor, cache);
 
-            // Sample next token using temperature, top_k, and top_p
+            // 从 logits 中采样下一个 token
             let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
 
-            // Add token to result
-            result.push(next_token);
-
-            // Check for EOS token
             if next_token == self.eos_token_id {
                 break;
             }
+            result.push(next_token);
+
+            // 更新输入，用于下一次生成
+            input_tensor = Tensor::<u32>::new(vec![next_token], &[1]);
         }
 
         result
@@ -192,70 +191,114 @@ impl Llama<f32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn self_attention(
-    hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
-    att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
-    q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
-    k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    n_kv_h: usize,                   // number of key/value heads
-    n_groups: usize,                 // number of query groups per k/v head
-    seq_len: usize,                  // length of current sequence
-    total_seq_len: usize,            // total sequence length including past
-    dqkv: usize,                     // dimension of keys/values per head
+pub fn self_attention(
+    hidden_states: &mut crate::tensor::Tensor<f32>, //隐藏层，[seq_len,total_head_num*d_head]
+    att_scores: &mut crate::tensor::Tensor<f32>,    //注意力分数
+    q: &crate::tensor::Tensor<f32>,                 //[seq_len,total_head_num*d_head]
+    k: &crate::tensor::Tensor<f32>,                 //[total_seq,num_key_value_heads*d_head]
+    v: &crate::tensor::Tensor<f32>,                 //[total_seq,num_key_value_heads*d_head]
+    n_kv_h: usize,                                  //kv头数,减少计算量
+    n_groups: usize,                                //每个 Key 组对应的 Query 头数,减少计算量
+    seq_len: usize,                                 // 输入序列长度
+    total_seq_len: usize,                           // 总序列长度
+    dqkv: usize,                                    // head_dim
 ) {
-    for h in 0..n_kv_h {
-        // Get the keys for this head - slice with correct start index
-        let k_head = k.slice(h * dqkv, &[total_seq_len, dqkv]);
+    {
+        let att_data = unsafe { att_scores.data_mut() };
+        att_data.fill(0.0);
+    }
 
-        for g in 0..n_groups {
-            // Get queries for this group with corrected slice index
-            let q_group = q.slice((h * n_groups + g) * dqkv, &[seq_len, dqkv]);
+    let q_data = q.data();
+    let k_data = k.data();
+    let inv_scale = 1.0 / (dqkv as f32).sqrt();
 
-            // Get scores buffer for this head and group
-            let scores_per_group = seq_len * total_seq_len;
-            let scores_start = h * n_groups * scores_per_group + g * scores_per_group;
-            let mut scores = att_scores.slice(scores_start, &[seq_len, total_seq_len]);
+    let total_head_num = n_kv_h * n_groups; //总头数
+    let total_d_q = total_head_num * dqkv; //头的总长度
+    let total_d_kv = n_kv_h * dqkv; //每个kv的长度
 
-            // Compute Q * K^T
-            unsafe {
-                let scores_data = scores.data_mut();
-                let q_data = q_group.data();
-                let k_data = k_head.data();
+    let total_d_atts_3 = n_groups * seq_len * total_seq_len;
+    let total_d_atts_2 = seq_len * total_seq_len;
 
-                for i in 0..seq_len {
-                    for j in 0..total_seq_len {
-                        let mut sum = 0.0;
-                        for d in 0..dqkv {
-                            sum += q_data[i * dqkv + d] * k_data[j * dqkv + d];
+    {
+        // 使用分块并行写入解决借用冲突
+        //let total_att_elements = n_kv_h * n_groups * seq_len * total_seq_len;
+        let att_data = unsafe { att_scores.data_mut() };
+
+        // 将注意力矩阵按KV头分块并行处理
+        att_data
+            .par_chunks_mut(total_d_atts_3)
+            .enumerate()
+            .for_each(|(index_kv_h, att_block)| {
+                let offset_k = index_kv_h * dqkv;
+
+                // 每个KV头内部按组并行
+                att_block
+                    .par_chunks_mut(total_d_atts_2)
+                    .enumerate()
+                    .for_each(|(curr_q_in_group, att_group_block)| {
+                        let curr_att_head = index_kv_h * n_groups + curr_q_in_group;
+                        let offset_q = curr_att_head * dqkv;
+
+                        // 按序列位置并行
+                        att_group_block
+                            .par_chunks_mut(total_seq_len)
+                            .enumerate()
+                            .for_each(|(i_seq, att_seq_block)| {
+                                let begin_vec_q = i_seq * total_d_q + offset_q;
+
+                                // 并行计算每个位置的注意力分数
+                                att_seq_block.par_iter_mut().enumerate().for_each(
+                                    |(i_tseq, att_val)| {
+                                        let begin_vec_k = i_tseq * total_d_kv + offset_k;
+
+                                        // 向量化点积计算（4路展开）
+                                        let mut dot = 0.0;
+                                        for k in (0..dqkv).step_by(4) {
+                                            let end = (k + 4).min(dqkv);
+                                            dot += q_data[begin_vec_q + k..begin_vec_q + end]
+                                                .iter()
+                                                .zip(&k_data[begin_vec_k + k..begin_vec_k + end])
+                                                .map(|(&q, &k)| q * k)
+                                                .sum::<f32>();
+                                        }
+
+                                        *att_val = dot * inv_scale;
+                                    },
+                                );
+                            });
+                    });
+            });
+    }
+
+    OP::masked_softmax(att_scores);
+
+    let att_data = att_scores.data();
+    let v_data = v.data();
+    {
+        let hs_data = unsafe { hidden_states.data_mut() };
+        hs_data.fill(0.0);
+
+        for index_kv_h in 0..n_kv_h {
+            let offset_matrix_v_g = index_kv_h * dqkv;
+            for curr_q_in_group in 0..n_groups {
+                let offset_matrix_a_h =
+                    curr_q_in_group * total_d_atts_2 + index_kv_h * total_d_atts_3;
+                for curr_idx_seq in 0..seq_len {
+                    let begin_vec_a = offset_matrix_a_h + curr_idx_seq * total_seq_len;
+                    for curr_idx_dhead in 0..dqkv {
+                        let begin_vec_v = curr_idx_dhead + offset_matrix_v_g;
+                        let mut sum_ = 0.0;
+                        for curr_idx_tseq in 0..total_seq_len {
+                            let idx_a = begin_vec_a + curr_idx_tseq;
+                            let idx_v = begin_vec_v + curr_idx_tseq * total_d_kv;
+                            sum_ += att_data[idx_a] * v_data[idx_v];
                         }
-                        scores_data[i * total_seq_len + j] = sum / (dqkv as f32).sqrt();
-                    }
-                }
-            }
 
-            // Apply softmax to scores
-            OP::masked_softmax(&mut scores);
-
-            // Get values for this head
-            let v_head = v.slice(h * dqkv, &[total_seq_len, dqkv]);
-
-            // Compute attention output (scores * V)
-            let out_offset = (h * n_groups + g) * dqkv;
-            let mut out = hidden_states.slice(0, &[seq_len, n_kv_h * n_groups * dqkv]);
-
-            unsafe {
-                let out_data = out.data_mut();
-                let scores_data = scores.data();
-                let v_data = v_head.data();
-
-                for i in 0..seq_len {
-                    for d in 0..dqkv {
-                        let mut sum = 0.0;
-                        for j in 0..total_seq_len {
-                            sum += scores_data[i * total_seq_len + j] * v_data[j * dqkv + d];
-                        }
-                        out_data[i * (n_kv_h * n_groups * dqkv) + out_offset + d] = sum;
+                        let curr_att_head = index_kv_h * n_groups + curr_q_in_group;
+                        let hs_offset = curr_idx_seq * (total_head_num * dqkv)
+                            + curr_att_head * dqkv
+                            + curr_idx_dhead;
+                        hs_data[hs_offset] = sum_;
                     }
                 }
             }
@@ -263,11 +306,10 @@ fn self_attention(
     }
 }
 
-/// 模型结构：Feed-Forward神经网络
 #[allow(clippy::too_many_arguments)]
 fn mlp(
-    residual: &mut Tensor<f32>,
-    hidden_states: &mut Tensor<f32>,
+    residual: &mut Tensor<f32>,      //输入残差
+    hidden_states: &mut Tensor<f32>, //隐藏层，自注意输出
     gate: &mut Tensor<f32>,
     up: &mut Tensor<f32>,
     w_up: &Tensor<f32>,
@@ -276,30 +318,23 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    // 1. hidden = rms_norm(residual)
-    OP::rms_norm(hidden_states, residual, rms_w, eps);
+    /*
+    act = gate * sigmoid(gate) * up ## SwiGLU
+    output = act @ down_weight.T
+    residual = output + residual
+    */
+    // Step 1: RMS normalization
+    OP::rms_norm(hidden_states, residual, rms_w, eps); //hidden = rms_norm(residual)
 
-    // 2. gate = hidden @ gate_weight.T
-    // 3. up = hidden @ up_weight.T
-    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
-    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0);
+    // Step 2: Compute gate and up branches
+    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0); // gate = hidden_states @ w_gate.T
+    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0); // up = hidden_states @ w_up.T
 
-    // 4. act = gate * sigmoid(gate) * up  (SwiGLU activation)
-    OP::swiglu(up, gate);
+    // Step 3: SwiGLU activation
+    OP::swiglu(up, gate); // gate = gate * sigmoid(gate) * up
 
-    // 5. output = act @ down_weight.T
-    // 结果直接存储在 residual 中，复用内存
-    OP::matmul_transb(residual, 0.0, up, w_down, 1.0);
-
-    // 6. residual = output + residual
-    // 在获取可变引用前先获取大小
-    let residual_size = residual.size();
-    let residual_data = unsafe { residual.data_mut() };
-    let hidden_data = hidden_states.data();
-
-    for i in 0..residual_size {
-        residual_data[i] += hidden_data[i];
-    }
+    // Step 4: Compute output
+    OP::matmul_transb(residual, 1.0, up, w_down, 1.0);
 }
 
 #[test]
