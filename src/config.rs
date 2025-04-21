@@ -1,3 +1,4 @@
+use serde;
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub(crate) struct LlamaConfigJson {
     pub bos_token_id: u32,

@@ -6,18 +6,30 @@ pub struct Tensor<T> {
     length: usize,
 }
 
+impl<T: Clone> Clone for Tensor<T> {
+    fn clone(&self) -> Self {
+        let data_clone: Box<[T]> = self.data.iter().cloned().collect();
+        Tensor {
+            data: Arc::new(data_clone),
+            shape: self.shape.clone(),
+            offset: self.offset,
+            length: self.length,
+        }
+    }
+}
+
 impl<T: Copy + Clone + Default> Tensor<T> {
-    pub fn new(data: Vec<T>, shape: &[usize]) -> Self {
+    pub fn new(data: Vec<T>, shape: &Vec<usize>) -> Self {
         let length = data.len();
         Tensor {
-            data: Arc::new(data.into_boxed_slice()),
-            shape: shape.to_owned(),
+            data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
+            shape: shape.clone(),
             offset: 0,
-            length,
+            length: length,
         }
     }
 
-    pub fn default(shape: &[usize]) -> Self {
+    pub fn default(shape: &Vec<usize>) -> Self {
         let length = shape.iter().product();
         let data = vec![T::default(); length];
         Self::new(data, shape)
@@ -51,15 +63,58 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         self
     }
 
-    pub fn slice(&self, start: usize, shape: &[usize]) -> Self {
+    pub fn slice(&self, start: usize, shape: &Vec<usize>) -> Self {
         let new_length: usize = shape.iter().product();
         assert!(self.offset + start + new_length <= self.length);
         Tensor {
             data: self.data.clone(),
-            shape: shape.to_owned(),
+            shape: shape.clone(),
             offset: self.offset + start,
             length: new_length,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    pub fn divide_by_row(&self, n: usize) -> Vec<Tensor<T>> {
+        let row = self.shape()[0];
+        assert!(row % n == 0, "Row count must be divisible by n");
+
+        let mut new_shape = self.shape().clone();
+        new_shape[0] /= n;
+        let mut result = Vec::new();
+        for i in 0..n {
+            result.push(self.slice(i * (row / n) * self.length / row, &new_shape.clone()));
+        }
+        result
+    }
+
+    pub fn divide_by_col(&self, n: usize) -> Vec<Tensor<T>> {
+        let (row, col) = (self.shape()[0], self.length / self.shape()[0]);
+        assert!(col % n == 0, "Column count must be divisible by n");
+
+        // 创建一个临时的 vector 来保存分割的列数据
+        let mut tmp_vec: Vec<Vec<T>> = vec![Vec::new(); n];
+        let data = self.data();
+        let w = col / n;
+
+        // 将数据分配到临时的列 vector 中
+        for i in 0..row {
+            for j in 0..col {
+                tmp_vec[j / w].push(data[i * col + j]);
+            }
+        }
+
+        // 创建结果中的每个 Tensor
+        let mut result = Vec::new();
+        let mut new_shape = self.shape().clone();
+        new_shape[1] /= n;
+        for i in 0..n {
+            result.push(Tensor::new(tmp_vec[i].clone(), &new_shape.clone()));
+        }
+        result
     }
 }
 
@@ -73,7 +128,7 @@ impl Tensor<f32> {
         let a = self.data();
         let b = other.data();
 
-        a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel))
+        return a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel));
     }
     #[allow(unused)]
     pub fn print(&self) {

@@ -1,7 +1,17 @@
 use crate::tensor::Tensor;
+use crate::types::F32;
+use crate::SuperTrait;
+use cust::memory::CopyDestination;
+use cust::memory::DeviceCopy;
+use cust::{launch, memory::DeviceBuffer, module::Module, stream::Stream};
+use num_traits::float::Float; // 使用 num_traits 库中的 Float trait 来支持浮点数操作
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 // get (row) vectors from a 2D table given a list of indices
-pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
+pub fn gather<T>(y: &mut Tensor<T>, indices: &Tensor<u32>, table: &Tensor<T>)
+where
+    T: Float + Copy + Clone + Default,
+{
     let length = indices.size();
     let table_shape = table.shape();
     assert!(table_shape.len() == 2);
@@ -14,8 +24,12 @@ pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
     }
 }
 
+// #[cfg(not(feature="gpu"))]
 // RoPE: Rotary Positional Embedding
-pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
+pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: T)
+where
+    T: Float + Sub<Output = T> + Mul<Output = T> + Copy + Clone + Default,
+{
     let shape = y.shape();
     assert!(shape.len() == 3);
     let seq_len = shape[0];
@@ -23,23 +37,36 @@ pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
     let d = shape[2];
     let data = unsafe { y.data_mut() };
     for tok in 0..seq_len {
-        let pos = start_pos + tok;
+        let pos = T::from(start_pos + tok).unwrap();
         for head in 0..n_heads {
             for i in 0..d / 2 {
-                let a = data[tok * n_heads * d + head * d + i];
-                let b = data[tok * n_heads * d + head * d + i + d / 2];
-                let freq = pos as f32 / theta.powf((i * 2) as f32 / d as f32);
+                let idx1 = tok * n_heads * d + head * d + i;
+                let idx2 = idx1 + d / 2;
+                let a = data[idx1];
+                let b = data[idx2];
+                let freq = pos / theta.powf(T::from(i * 2).unwrap() / T::from(d).unwrap());
                 let (sin, cos) = freq.sin_cos();
-                data[tok * n_heads * d + head * d + i] = a * cos - b * sin;
-                data[tok * n_heads * d + head * d + i + d / 2] = b * cos + a * sin;
+                data[idx1] = a * cos - b * sin;
+                data[idx2] = b * cos + a * sin;
             }
         }
     }
 }
 
+#[cfg(not(feature = "gpu"))]
 // softmax(x) = exp(x - max) / sum(exp(x - max))
 // y = softmax(mask(x))
-pub fn masked_softmax(y: &mut Tensor<f32>) {
+pub fn masked_softmax<T>(y: &mut Tensor<T>)
+where
+    T: Float
+        + Sub<Output = T>
+        + Div<Output = T>
+        + Copy
+        + Clone
+        + Default
+        + std::iter::Sum
+        + std::ops::DivAssign,
+{
     let ndim = y.shape().len();
     assert!(ndim >= 2);
     let seq_len = y.shape()[ndim - 2];
@@ -54,7 +81,7 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 
             let max = data[offset..offset + boundary]
                 .iter()
-                .fold(data[offset], |a, b| a.max(*b));
+                .fold(data[offset], |a, &b| a.max(b));
 
             let sum = (0..boundary)
                 .map(|j| {
@@ -62,161 +89,126 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
                     data[offset + j] = e;
                     e
                 })
-                .sum::<f32>();
+                .sum::<T>();
 
             (0..boundary).for_each(|j| data[offset + j] /= sum);
-            (boundary..total_seq_len).for_each(|j| data[offset + j] = 0.0);
+            (boundary..total_seq_len).for_each(|j| data[offset + j] = T::zero());
         }
     }
 }
 
-pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    // 1. 检查输入的合法性
-    assert_eq!(
-        x.shape(),
-        y.shape(),
-        "Input and output tensors must have the same shape"
-    );
-    let x_shape = x.shape();
-    assert!(!x_shape.is_empty(), "Input tensor cannot be empty");
+#[cfg(not(feature = "gpu"))]
+pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: T)
+where
+    T: Float
+        + Mul<Output = T>
+        + Add<Output = T>
+        + Div<Output = T>
+        + Copy
+        + Clone
+        + Default
+        + std::iter::Sum,
+{
+    let dim = x.shape()[x.shape().len() - 1];
+    let batch = x.size() / dim;
 
-    // 获取最后一维的大小
-    let last_dim = *x_shape.last().unwrap();
+    for i in 0..batch {
+        let start = i * dim;
+        let x_i = &x.data()[start..][..dim];
+        let y_i = &mut unsafe { y.data_mut() }[start..][..dim];
 
-    // 检查权重向量维度
-    assert_eq!(
-        w.shape(),
-        &vec![last_dim],
-        "Weight tensor must match the last dimension"
-    );
+        let f = (x_i.iter().map(|&x_ii| x_ii * x_ii).sum::<T>() / T::from(dim).unwrap() + epsilon)
+            .sqrt();
 
-    // 2. 获取数据访问
-    let x_data = x.data();
-    let w_data = w.data();
-    let y_data = unsafe { y.data_mut() };
-
-    // 计算向量数量（总元素数除以最后一维的大小）
-    let total_size = x.size();
-    let num_vectors = total_size / last_dim;
-
-    // 3. 对每个向量进行 RMS Normalization
-    for i in 0..num_vectors {
-        let start_idx = i * last_dim;
-
-        // 计算均方和
-        let mut sum_squares = 0.0f32;
-        for j in 0..last_dim {
-            let val = x_data[start_idx + j];
-            sum_squares += val * val;
-        }
-
-        // 计算 RMS (root mean square)
-        let rms = (sum_squares / last_dim as f32 + epsilon).sqrt();
-
-        // 应用归一化和权重
-        for j in 0..last_dim {
-            let idx = start_idx + j;
-            y_data[idx] = (x_data[idx] / rms) * w_data[j];
-        }
+        y_i.iter_mut()
+            .zip(
+                x_i.iter()
+                    .zip(w.data().iter())
+                    .map(|(&x_ii, &w_i)| x_ii * w_i / f),
+            )
+            .for_each(|(y_ii, x_ii)| *y_ii = x_ii);
     }
 }
 
+#[cfg(not(feature = "gpu"))]
 // y = silu(x) * y
 // hint: this is an element-wise operation
-pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
+pub fn swiglu<T>(y: &mut Tensor<T>, x: &Tensor<T>)
+where
+    T: Float + Mul<Output = T> + Add<Output = T> + Neg<Output = T> + Copy + Clone + Default,
+{
     let len = y.size();
-    assert!(len == x.size(), "Tensors must have the same size");
+    assert!(len == x.size());
 
-    // Get mutable slice for y and immutable slice for x
-    let y_data = unsafe { y.data_mut() };
-    let x_data = x.data();
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
 
-    // Perform element-wise SwiGLU operation
-    // SwiGLU: y = silu(x) * y
-    // where silu(x) = x * sigmoid(x)
-    for i in 0..len {
-        // Calculate sigmoid(x): 1 / (1 + e^(-x))
-        let sigmoid_x = 1.0 / (1.0 + (-x_data[i]).exp());
-
-        // Calculate silu(x) = x * sigmoid(x)
-        let silu_x = x_data[i] * sigmoid_x;
-
-        // Multiply result with y (in-place)
-        y_data[i] *= silu_x;
+    unsafe {
+        y.data_mut()
+            .iter_mut()
+            .zip(
+                x.data()
+                    .iter()
+                    .map(|x_i| T::one() / (T::one() + (-*x_i).exp()))
+                    .zip(x.data().iter())
+                    .map(|(s_x, x_i)| s_x * *x_i),
+            )
+            .for_each(|(y_i, s_x)| *y_i = s_x * (*y_i));
     }
 }
 
-/// 矩阵乘（Transpose B）算子
-/// C = beta * C + alpha * A @ B^T
-/// hint: You don't need to do an explicit transpose of B
-pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    // 1. 获取维度信息并进行检查
-    let a_shape = a.shape();
-    let b_shape = b.shape();
-    let c_shape = c.shape();
+#[cfg(not(feature = "gpu"))]
+// C = beta * C + alpha * A @ B^T
+// hint: You don't need to do an explicit transpose of B
+pub fn matmul_transb<T>(c: &mut Tensor<T>, beta: T, a: &Tensor<T>, b: &Tensor<T>, alpha: T)
+where
+    T: Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default,
+{
+    // 获取矩阵的维度
+    let dim1 = a.shape()[0];
+    let dim2 = b.shape()[0];
+    let dim3 = a.shape()[1];
 
-    assert_eq!(a_shape.len(), 2, "Matrix A must be 2-dimensional");
-    assert_eq!(b_shape.len(), 2, "Matrix B must be 2-dimensional");
-    assert_eq!(c_shape.len(), 2, "Matrix C must be 2-dimensional");
+    // 检查维度是否匹配
+    assert_eq!(a.shape()[1], b.shape()[1], "矩阵 a 和 b 的列数不匹配");
+    assert_eq!(c.shape()[0], dim1, "矩阵 c 的行数与矩阵 a 的行数不匹配");
+    assert_eq!(c.shape()[1], dim2, "矩阵 c 的列数与矩阵 b 的行数不匹配");
 
-    let (m, k) = (a_shape[0], a_shape[1]); // A: m × k
-    let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × b_k
-
-    // 修改维度检查：A的列数(k)应该等于B的列数(b_k)
-    assert_eq!(
-        k, b_k,
-        "Inner dimensions must match for A @ B^T: A is {}×{}, B is {}×{}",
-        m, k, n, b_k
-    );
-    assert_eq!(c_shape[0], m, "Output matrix C must have {} rows", m);
-    assert_eq!(c_shape[1], n, "Output matrix C must have {} columns", n);
-
-    // 2. 获取数据访问
-    let a_data = a.data();
-    let b_data = b.data();
-    let c_data = unsafe { c.data_mut() };
-
-    // 3. 实现 C = beta * C + alpha * A @ B^T
-    // 对每个输出元素 C[i,j] 计算
-    for i in 0..m {
-        for j in 0..n {
-            let c_idx = i * n + j;
-
-            // 首先应用 beta * C
-            let mut sum = beta * c_data[c_idx];
-
-            // 计算 A @ B^T 的对应元素
-            // C[i,j] = sum(A[i,k] * B[j,k]) 因为B是转置的
-            for p in 0..k {
-                let a_idx = i * k + p; // A[i,p]
-                let b_idx = j * b_k + p; // B[j,p]
-                sum += alpha * a_data[a_idx] * b_data[b_idx];
+    // 遍历矩阵进行计算
+    for i in 0..dim1 {
+        for j in 0..dim2 {
+            let mut sum = T::zero(); // 使用泛型的零值
+            for k in 0..dim3 {
+                sum = sum + a.data()[i * dim3 + k] * b.data()[j * dim3 + k];
             }
-
-            c_data[c_idx] = sum;
+            unsafe {
+                c.data_mut()[i * dim2 + j] = sum * alpha + c.data()[i * dim2 + j] * beta;
+            }
         }
     }
 }
 
 // Dot product of two tensors (treated as vectors)
 #[allow(unused)]
-pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
+pub fn dot<T>(x: &Tensor<T>, y: &Tensor<T>) -> T
+where
+    T: Float + Mul<Output = T> + Add<Output = T> + Copy + Default,
+{
     let len = x.size();
     assert!(len == y.size());
-    let x_ = x.data();
-    let y_ = y.data();
-    let mut sum = 0.0;
-    for i in 0..len {
-        sum += x_[i] * y_[i];
-    }
-    sum
+    x.data()
+        .iter()
+        .zip(y.data().iter())
+        .fold(T::zero(), |sum, (&xi, &yi)| sum + xi * yi)
 }
 
 // Sample a index from a tensor (treated as a probability vector)
-#[warn(dead_code)]
-pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) -> u32 {
+pub fn random_sample<T>(x: &Tensor<T>, top_p: T, top_k: u32, temperature: T) -> u32
+where
+    T: Float + PartialOrd + Clone + Copy + Default,
+{
     assert!(x.shape()[x.shape().len() - 1] == x.size());
-    if temperature <= 0. || top_k < 2 || top_p <= 0. {
+    if temperature <= T::zero() || top_k < 2 || top_p <= T::zero() {
         return x
             .data()
             .iter()
@@ -247,11 +239,12 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
             }
         }
     }
-    impl From<(usize, &f32)> for Probability {
+
+    impl<T: Float> From<(usize, &T)> for Probability {
         #[inline]
-        fn from((i, p): (usize, &f32)) -> Self {
+        fn from((i, p): (usize, &T)) -> Self {
             Self {
-                val: *p,
+                val: p.to_f32().unwrap(),
                 tok: i as _,
             }
         }
@@ -265,17 +258,49 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
         .map(Probability::from)
         .collect::<Vec<_>>();
     logits.sort_unstable();
-    let max = core::mem::replace(&mut logits[0].val, 1.);
+    let max = core::mem::replace(&mut logits[0].val, 1.0);
     // softmax & sum
     for i in 1..logits.len() {
-        logits[i].val = logits[i - 1].val + ((logits[i].val - max) / temperature).exp();
+        logits[i].val =
+            logits[i - 1].val + ((logits[i].val - max) / temperature.to_f32().unwrap()).exp();
     }
     // topk & topp & random
     let pk = logits[(top_k as usize).min(logits.len()) - 1].val;
-    let pp = logits[logits.len() - 1].val * top_p;
+    let pp = logits[logits.len() - 1].val * top_p.to_f32().unwrap();
     let plimit = rand::random::<f32>() * f32::min(pk, pp);
     // sample
     logits.iter().find(|p| p.val >= plimit).unwrap().tok
+}
+
+#[test]
+fn test_rope() {
+    // 创建一个输入张量 y，大小为 [3, 2, 4]，即 seq_len=3, n_heads=2, d=4
+    let mut y = Tensor::<f32>::new(
+        vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+            17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+        ],
+        &vec![3, 2, 4],
+    );
+
+    // 设置起始位置和 theta
+    let start_pos = 0;
+    let theta = 10000.0_f32;
+
+    // 调用 rope 函数
+    rope(&mut y, start_pos, theta);
+
+    // 创建期望的输出张量，假设我们计算出以下值（这仅为示例，实际值需要根据公式计算）
+    let expected = Tensor::<f32>::new(
+        vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, -4.3934603, 9.879502, 13.516563, 12.099399,
+            -5.598135, 13.839303, 19.043655, 16.139198, -24.351147, 17.596428, 7.5512652,
+            20.355976, -29.652924, 21.515633, 9.523868, 24.435171,
+        ],
+        &vec![3, 2, 4],
+    ); // 根据实际计算修改这里的值
+       // 检查结果是否接近预期值
+    assert!(y.close_to(&expected, 1e-3)); // 允许精度误差为 1e-3
 }
 
 // Your implementation should at least pass the following tests:
@@ -315,4 +340,457 @@ fn test_matmul_transb() {
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
     ));
+}
+#[test]
+fn test_masked_softmax() {
+    // 初始化输入张量 y
+    let mut y = Tensor::<f32>::new(
+        vec![
+            1.0, 2.0, 3.0, 4.0, // 第一个序列
+            5.0, 6.0, 7.0, 8.0, // 第二个序列
+        ],
+        &vec![2, 4], // 形状为 [batch=2, seq_len=4]
+    );
+
+    // 调用 masked_softmax 函数
+    masked_softmax(&mut y);
+
+    // 验证结果是否接近预期值
+    assert!(y.close_to(
+        &Tensor::<f32>::new(
+            vec![
+                0.09003057, 0.24472847, 0.66524095, 0.0, // 第一个序列
+                0.0320586, 0.08714432, 0.23688282, 0.6439142, // 第二个序列
+            ],
+            &vec![2, 4],
+        ),
+        1e-3, // 允许的误差范围
+    ));
+}
+use cust::prelude::Context;
+use std::thread;
+#[cfg(feature = "gpu")]
+static mut _CTX: Option<Context> = None;
+#[cfg(feature = "gpu")]
+static mut STREAM: Option<Stream> = None;
+#[cfg(feature = "gpu")]
+static mut MODULE: Option<Module> = None;
+#[cfg(feature = "gpu")]
+static PTX: &str = include_str!("../cuda/operator.ptx");
+#[cfg(feature = "gpu")]
+static mut CURRENT_THREADID: Option<thread::ThreadId> = None;
+#[cfg(feature = "gpu")]
+fn get_threadid() -> &'static thread::ThreadId {
+    unsafe {
+        let id = match CURRENT_THREADID.as_mut() {
+            Some(x) => x,
+            None => {
+                let x = thread::current().id();
+                CURRENT_THREADID = Some(x);
+                CURRENT_THREADID.as_ref().unwrap()
+            }
+        };
+        id
+    }
+}
+#[cfg(feature = "gpu")]
+fn get_ctx() -> &'static Context {
+    unsafe {
+        let _ctx = match _CTX.as_mut() {
+            Some(x) => {
+                if get_threadid().eq(&thread::current().id()) {
+                    x
+                } else {
+                    let x: cust::prelude::Context = cust::quick_init().unwrap();
+                    _CTX = Some(x);
+                    _CTX.as_ref().unwrap()
+                }
+            }
+            None => {
+                let x: cust::prelude::Context = cust::quick_init().unwrap();
+                _CTX = Some(x);
+                _CTX.as_ref().unwrap()
+            }
+        };
+        _ctx
+    }
+}
+#[cfg(feature = "gpu")]
+fn get_stream() -> &'static Stream {
+    unsafe {
+        get_ctx();
+        let stream = match STREAM.as_mut() {
+            Some(x) => {
+                if get_threadid().eq(&thread::current().id()) {
+                    x
+                } else {
+                    let x = Stream::new(cust::stream::StreamFlags::DEFAULT, None).unwrap();
+                    STREAM = Some(x);
+                    STREAM.as_ref().unwrap()
+                }
+            }
+            None => {
+                let x = Stream::new(cust::stream::StreamFlags::DEFAULT, None).unwrap();
+                STREAM = Some(x);
+                STREAM.as_ref().unwrap()
+            }
+        };
+        stream
+    }
+}
+#[cfg(feature = "gpu")]
+fn get_module() -> &'static Module {
+    unsafe {
+        let module = match MODULE.as_mut() {
+            Some(x) => {
+                if get_threadid().eq(&thread::current().id()) {
+                    x
+                } else {
+                    let x: Module = Module::from_ptx(PTX, &[]).unwrap();
+                    MODULE = Some(x);
+                    MODULE.as_ref().unwrap()
+                }
+            }
+            None => {
+                let x: Module = Module::from_ptx(PTX, &[]).unwrap();
+                MODULE = Some(x);
+                MODULE.as_ref().unwrap()
+            }
+        };
+        module
+    }
+}
+// #[cfg(feature="gpu")]
+// pub fn rope<T>(
+//     y: &mut Tensor<T>,
+//     start_pos: usize,
+//     theta: T,
+// ) where
+//     T: Float + Sub<Output = T> + Mul<Output = T> + Copy + Clone + Default + DeviceCopy,
+// {
+//     let shape = y.shape();
+//     assert!(shape.len() == 3);
+//     let seq_len = shape[0];
+//     let n_heads = shape[1];
+//     let d = shape[2];
+
+//     // 初始化 CUDA 环境
+//     let _ctx = cust::quick_init().unwrap();
+//     let stream = Stream::new(cust::stream::StreamFlags::DEFAULT, None).unwrap();
+
+//     // 加载 PTX 模块
+//     let ptx = include_str!("../cuda/rope_kernel.ptx");
+//     let module = Module::from_ptx(ptx, &[]).unwrap();
+
+//     // 获取内核函数
+//     let kernel = module.get_function("rope_kernel").unwrap();
+
+//     // 将数据复制到 GPU
+//     let mut y_gpu = DeviceBuffer::from_slice(y.data()).unwrap();
+
+//     // 定义线程块和网格大小
+//     let threads_per_block = 256; // 每个线程块处理 256 个元素
+//     let blocks_per_grid = ((seq_len * n_heads * d) as u32 + threads_per_block - 1) / threads_per_block;
+
+//     // 启动内核
+//     unsafe {
+//         launch!(
+//             kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(
+//                 y_gpu.as_device_ptr(),
+//                 seq_len as i32,
+//                 n_heads as i32,
+//                 d as i32,
+//                 start_pos as i32,
+//                 theta
+//             )
+//         )
+//         .unwrap();
+//     }
+
+//     // 同步流以确保计算完成
+//     stream.synchronize().unwrap();
+
+//     // 将结果从 GPU 复制回主机
+//     unsafe {
+//         y_gpu.copy_to(y.data_mut()).unwrap();
+//     }
+// }
+
+#[cfg(feature = "gpu")]
+pub fn masked_softmax<T: SuperTrait>(y: &mut Tensor<T>, // 确保使用f32类型
+) {
+    let ndim = y.shape().len();
+    assert!(ndim >= 2);
+    let seq_len = y.shape()[ndim - 2];
+    let total_seq_len = y.shape()[ndim - 1];
+    let batch = y.size() / (seq_len * total_seq_len);
+
+    let stream = get_stream();
+    let module = get_module();
+
+    // 获取内核函数
+    let kernel = module.get_function("masked_softmax_kernel").unwrap();
+
+    // 将数据复制到 GPU
+    let y_gpu = DeviceBuffer::from_slice(
+        y.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+
+    // 计算执行配置
+    let threads_per_block: u32 = 256;
+    let num_rows = batch * seq_len;
+    let blocks_per_grid = num_rows as u32;
+    let shared_mem_bytes: u32 = 2 * threads_per_block * std::mem::size_of::<f32>() as u32;
+
+    // 启动内核
+    unsafe {
+        launch!(
+            kernel<<<blocks_per_grid, threads_per_block, shared_mem_bytes, stream>>>(
+                y_gpu.as_device_ptr(),
+                batch as i32,
+                seq_len as i32,
+                total_seq_len as i32
+            )
+        )
+        .unwrap();
+    }
+
+    // 同步并传回数据
+    stream.synchronize().unwrap();
+    unsafe {
+        let mut temp_f32 = vec![0.0f32; y_gpu.len()];
+        y_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32
+            .into_iter()
+            .map(|x| <T as F32>::from_f32(x))
+            .collect();
+        y.data_mut().copy_from_slice(&converted);
+    }
+}
+
+#[cfg(feature = "gpu")]
+pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: T)
+where
+    T: SuperTrait,
+{
+    let device_id = 0;
+    let dim = x.shape()[x.shape().len() - 1];
+    let batch = x.size() / dim;
+    let stream = get_stream();
+    let module = get_module();
+    let kernel = module.get_function("rms_norm_kernel").unwrap();
+
+    // 将数据复制到 GPU
+    let x_gpu = DeviceBuffer::from_slice(
+        x.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+    let w_gpu = DeviceBuffer::from_slice(
+        w.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+    let mut y_gpu = DeviceBuffer::from_slice(
+        y.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+
+    // 定义线程块和网格大小
+    let threads_per_block = 256; // 每个线程块处理 256 个元素
+    let blocks_per_grid = ((batch * dim) as u32 + threads_per_block - 1) / threads_per_block;
+
+    // 启动内核
+    unsafe {
+        launch!(
+            kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(
+                x_gpu.as_device_ptr(),
+                w_gpu.as_device_ptr(),
+                y_gpu.as_device_ptr(),
+                dim as i32,
+                batch as i32,
+                epsilon.as_f32()
+            )
+        )
+        .unwrap();
+    }
+
+    // 同步流以确保计算完成
+    stream.synchronize().unwrap();
+
+    // 将结果从 GPU 复制回主机
+    unsafe {
+        let mut temp_f32 = vec![0.0f32; y_gpu.len()];
+        y_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32
+            .into_iter()
+            .map(|x| <T as F32>::from_f32(x))
+            .collect();
+        y.data_mut().copy_from_slice(&converted);
+    }
+}
+
+#[cfg(feature = "gpu")]
+pub fn swiglu<T>(y: &mut Tensor<T>, x: &Tensor<T>)
+where
+    T: SuperTrait,
+{
+    let len = y.size();
+    assert_eq!(len, x.size(), "输入和输出张量的大小必须相同");
+
+    let stream = get_stream();
+    let module = get_module();
+
+    // 获取内核函数
+    let kernel = module.get_function("swiglu_kernel").unwrap();
+
+    // 将数据复制到 GPU
+    let x_gpu = DeviceBuffer::from_slice(
+        x.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+    let y_gpu = DeviceBuffer::from_slice(
+        y.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+
+    // 定义线程块和网格大小
+    let threads_per_block = 256; // 每个线程块处理 256 个元素
+    let blocks_per_grid = (len as u32 + threads_per_block - 1) / threads_per_block;
+
+    // 启动内核
+    unsafe {
+        launch!(
+            kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(
+                x_gpu.as_device_ptr(),
+                y_gpu.as_device_ptr(),
+                len as i32
+            )
+        )
+        .unwrap();
+    }
+
+    // 同步流以确保计算完成
+    stream.synchronize().unwrap();
+
+    // 将结果从 GPU 复制回主机
+    unsafe {
+        let mut temp_f32 = vec![0.0f32; y_gpu.len()];
+        y_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32
+            .into_iter()
+            .map(|x| <T as F32>::from_f32(x))
+            .collect();
+        y.data_mut().copy_from_slice(&converted);
+    }
+}
+
+#[cfg(feature = "gpu")]
+pub fn matmul_transb<T>(c: &mut Tensor<T>, beta: T, a: &Tensor<T>, b: &Tensor<T>, alpha: T)
+where
+    T: Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + F32,
+{
+    // 获取矩阵维度
+
+    use crate::types::F32;
+    let dim1 = a.shape()[0];
+    let dim2 = b.shape()[0];
+    let dim3 = a.shape()[1];
+
+    // 检查维度是否匹配
+    assert_eq!(a.shape()[1], b.shape()[1], "矩阵 a 和 b 的列数不匹配");
+    assert_eq!(c.shape()[0], dim1, "矩阵 c 的行数与矩阵 a 的行数不匹配");
+    assert_eq!(c.shape()[1], dim2, "矩阵 c 的列数与矩阵 b 的行数不匹配");
+
+    let stream = get_stream();
+    let module = get_module();
+
+    // 获取内核函数
+    let kernel = module.get_function("matmul_transb_kernel").unwrap();
+
+    // 将数据复制到 GPU
+    // 转换为f32数据
+    let a_gpu = DeviceBuffer::from_slice(
+        a.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+    let b_gpu = DeviceBuffer::from_slice(
+        b.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+    let c_gpu = DeviceBuffer::from_slice(
+        c.data()
+            .iter()
+            .map(|&x| x.as_f32())
+            .collect::<Vec<f32>>()
+            .as_slice(),
+    )
+    .unwrap();
+
+    // 定义线程块和网格大小
+    let threads_per_block = (16, 16); // 每个线程块处理 16x16 的子矩阵
+    let blocks_per_grid = (
+        (dim2 as u32 + threads_per_block.0 - 1) / threads_per_block.0,
+        (dim1 as u32 + threads_per_block.1 - 1) / threads_per_block.1,
+    );
+
+    // 启动内核
+    unsafe {
+        launch!(
+            kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(
+                a_gpu.as_device_ptr(),
+                b_gpu.as_device_ptr(),
+                c_gpu.as_device_ptr(),
+                dim1 as i32,
+                dim2 as i32,
+                dim3 as i32,
+                alpha.as_f32(),
+                beta.as_f32()
+            )
+        )
+        .unwrap();
+    }
+
+    // 同步流以确保计算完成
+    stream.synchronize().unwrap();
+    unsafe {
+        let mut temp_f32 = vec![0.0f32; c_gpu.len()];
+        c_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32
+            .into_iter()
+            .map(|x| <T as F32>::from_f32(x))
+            .collect();
+        c.data_mut().copy_from_slice(&converted);
+    }
 }
