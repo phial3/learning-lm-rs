@@ -1,4 +1,6 @@
+use half::f16;
 use std::{slice, sync::Arc, vec};
+
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
@@ -6,18 +8,42 @@ pub struct Tensor<T> {
     length: usize,
 }
 
+pub trait ToF32 {
+    fn to_f32(&self) -> f32;
+}
+
+impl ToF32 for f32 {
+    fn to_f32(&self) -> f32 {
+        *self
+    }
+}
+
+impl ToF32 for f16 {
+    fn to_f32(&self) -> f32 {
+        self.to_f32()
+    }
+}
+
+// #[allow(dead_code)]
+// impl Tensor<f16> {
+//     pub fn to_f32(&self) -> Tensor<f32> {
+//         let data_f32: Vec<f32> = self.data().iter().map(|&x| x.to_f32()).collect();
+//         Tensor::new(data_f32, &self.shape)
+//     }
+// }
+
 impl<T: Copy + Clone + Default> Tensor<T> {
-    pub fn new(data: Vec<T>, shape: &[usize]) -> Self {
+    pub fn new(data: Vec<T>, shape: &Vec<usize>) -> Self {
         let length = data.len();
         Tensor {
-            data: Arc::new(data.into_boxed_slice()),
-            shape: shape.to_owned(),
+            data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
+            shape: shape.clone(),
             offset: 0,
-            length,
+            length: length,
         }
     }
 
-    pub fn default(shape: &[usize]) -> Self {
+    pub fn default(shape: &Vec<usize>) -> Self {
         let length = shape.iter().product();
         let data = vec![T::default(); length];
         Self::new(data, shape)
@@ -51,12 +77,12 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         self
     }
 
-    pub fn slice(&self, start: usize, shape: &[usize]) -> Self {
+    pub fn slice(&self, start: usize, shape: &Vec<usize>) -> Self {
         let new_length: usize = shape.iter().product();
         assert!(self.offset + start + new_length <= self.length);
         Tensor {
             data: self.data.clone(),
-            shape: shape.to_owned(),
+            shape: shape.clone(),
             offset: self.offset + start,
             length: new_length,
         }
@@ -73,7 +99,7 @@ impl Tensor<f32> {
         let a = self.data();
         let b = other.data();
 
-        a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel))
+        return a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel));
     }
     #[allow(unused)]
     pub fn print(&self) {

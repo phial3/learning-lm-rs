@@ -1,13 +1,19 @@
+use rayon::prelude::*;
+use safetensors::SafeTensors;
+use serde_json;
+use std::collections::HashMap;
 use std::fs::File;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::vec;
+use uuid::Uuid;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators as OP;
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
-use safetensors::SafeTensors;
-use std::path::Path;
+use std::io::Write;
 
 pub struct Llama<T> {
     vocab: usize,           // vocab size
@@ -21,14 +27,15 @@ pub struct Llama<T> {
     rope_theta: f32,        // rope theta for rope initialization
     max_seq_len: usize,     // maximum sequence length
     params: LLamaParams<T>, // trained weights of this model
-    bos_token_id: u32,      // start token id
+    #[allow(dead_code)]
+    bos_token_id: u32, // start token id
     eos_token_id: u32,      // end token id
 }
 
 impl Llama<f32> {
     pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
-        let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
-        let config: LlamaConfigJson = serde_json::from_reader(config).unwrap();
+        let config_file = File::open(model_dir.as_ref().join("config.json")).unwrap();
+        let config: LlamaConfigJson = serde_json::from_reader(config_file).unwrap();
         let model_file = std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
         let safetensor = SafeTensors::deserialize(&model_file).unwrap();
         let params = LLamaParams::from_safetensors(&safetensor, &config);
@@ -62,13 +69,13 @@ impl Llama<f32> {
         let n_groups = self.n_q_h / self.n_kv_h;
 
         // Some pre-allocated buffers that will be reused
-        let mut residual = Tensor::<f32>::default(&[seq_len, self.d]);
-        let mut hidden_states = Tensor::<f32>::default(&[seq_len, self.d]);
-        let mut q_buf = Tensor::<f32>::default(&[seq_len, self.n_q_h * self.dqkv]);
+        let mut residual = Tensor::<f32>::default(&vec![seq_len, self.d]);
+        let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
+        let mut q_buf = Tensor::<f32>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
         let mut att_scores =
-            Tensor::<f32>::default(&[self.n_kv_h, n_groups, seq_len, total_seq_len]);
-        let mut gate_buf = Tensor::<f32>::default(&[seq_len, self.di]);
-        let mut up_buf = Tensor::<f32>::default(&[seq_len, self.di]);
+            Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
+        let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
+        let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
 
         // Computation Starts Here
         // Embedding lookup
@@ -82,7 +89,7 @@ impl Llama<f32> {
                 self.eps,
             );
 
-            let q = q_buf.reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
+            let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
             let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
@@ -102,11 +109,11 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            // Implement self-attention
+            // 实现self_attention
             self_attention(
                 &mut hidden_states,
                 &mut att_scores,
-                q,
+                q.reshape(&vec![seq_len, self.n_q_h * self.dqkv]),
                 full_k,
                 full_v,
                 self.n_kv_h,
@@ -116,16 +123,22 @@ impl Llama<f32> {
                 self.dqkv,
             );
 
-            // Down projection and residual connection
+            // 计算输出投影并更新残差
+            let mut out_proj = Tensor::<f32>::default(&vec![seq_len, self.d]);
             OP::matmul_transb(
-                &mut residual,
-                0.0,
+                &mut out_proj,
+                0.,
                 &hidden_states,
                 &self.params.wo[layer],
                 1.0,
             );
+            let out_data = out_proj.data();
+            let resid_data = unsafe { residual.data_mut() };
+            for i in 0..resid_data.len() {
+                resid_data[i] += out_data[i];
+            }
 
-            // MLP layer
+            // 实现MLP部分
             mlp(
                 &mut residual,
                 &mut hidden_states,
@@ -141,9 +154,9 @@ impl Llama<f32> {
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
-        let mut logits = Tensor::<f32>::default(&[1, self.vocab]);
-        let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &[1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &[1, self.d]);
+        let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
+        let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -166,22 +179,22 @@ impl Llama<f32> {
         temperature: f32,
     ) -> Vec<u32> {
         let mut result = token_ids.to_vec();
+
+        if result.is_empty() {
+            result.push(self.bos_token_id);
+        }
+
         let mut cache = self.new_cache();
+        let prompt_tensor = Tensor::<u32>::new(result.clone(), &vec![result.len()]);
+        let _ = self.forward(&prompt_tensor, &mut cache);
 
-        while result.len() < max_len {
-            // Create input tensor from current sequence
-            let input = Tensor::new(result.clone(), &[result.len()]);
-
-            // Forward pass to get logits
-            let logits = self.forward(&input, &mut cache);
-
-            // Sample next token using temperature, top_k, and top_p
+        for _ in 0..max_len {
+            let last_token = *result.last().unwrap();
+            let input_tensor = Tensor::<u32>::new(vec![last_token], &vec![1]);
+            let logits = self.forward(&input_tensor, &mut cache);
             let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
-
-            // Add token to result
             result.push(next_token);
 
-            // Check for EOS token
             if next_token == self.eos_token_id {
                 break;
             }
@@ -191,80 +204,110 @@ impl Llama<f32> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn self_attention(
-    hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
-    att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
-    q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
-    k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    n_kv_h: usize,                   // number of key/value heads
-    n_groups: usize,                 // number of query groups per k/v head
-    seq_len: usize,                  // length of current sequence
-    total_seq_len: usize,            // total sequence length including past
-    dqkv: usize,                     // dimension of keys/values per head
+    hidden_states: &mut Tensor<f32>,
+    att_scores: &mut Tensor<f32>,
+    q: &Tensor<f32>,
+    k: &Tensor<f32>,
+    v: &Tensor<f32>,
+    n_kv_h: usize,
+    n_groups: usize,
+    seq_len: usize,
+    total_seq_len: usize,
+    dqkv: usize,
 ) {
-    for h in 0..n_kv_h {
-        // Get the keys for this head - slice with correct start index
-        let k_head = k.slice(h * dqkv, &[total_seq_len, dqkv]);
+    let q_data = q.data();
+    let k_data = k.data();
+    let v_data = v.data();
+    let scale = 1.0 / (dqkv as f32).sqrt();
 
-        for g in 0..n_groups {
-            // Get queries for this group with corrected slice index
-            let q_group = q.slice((h * n_groups + g) * dqkv, &[seq_len, dqkv]);
+    // 计算注意力分数
+    {
+        let scores: Vec<_> = (0..n_kv_h)
+            .into_par_iter()
+            .map(|kv_head| {
+                let mut head_scores = vec![0.0; n_groups * seq_len * total_seq_len];
 
-            // Get scores buffer for this head and group
-            let scores_per_group = seq_len * total_seq_len;
-            let scores_start = h * n_groups * scores_per_group + g * scores_per_group;
-            let mut scores = att_scores.slice(scores_start, &[seq_len, total_seq_len]);
+                for group in 0..n_groups {
+                    for i in 0..seq_len {
+                        let base_q = (i * n_kv_h * n_groups + kv_head * n_groups + group) * dqkv;
+                        let base_k = kv_head * dqkv;
 
-            // Compute Q * K^T
-            unsafe {
-                let scores_data = scores.data_mut();
-                let q_data = q_group.data();
-                let k_data = k_head.data();
+                        for j in 0..total_seq_len {
+                            let score: f32 = (0..dqkv)
+                                .map(|p| {
+                                    q_data[base_q + p] * k_data[j * n_kv_h * dqkv + base_k + p]
+                                })
+                                .sum();
 
-                for i in 0..seq_len {
-                    for j in 0..total_seq_len {
-                        let mut sum = 0.0;
-                        for d in 0..dqkv {
-                            sum += q_data[i * dqkv + d] * k_data[j * dqkv + d];
+                            let idx = group * (seq_len * total_seq_len) + i * total_seq_len + j;
+                            head_scores[idx] = score * scale;
                         }
-                        scores_data[i * total_seq_len + j] = sum / (dqkv as f32).sqrt();
                     }
+                }
+                head_scores
+            })
+            .collect();
+
+        // 将计算结果写回 att_scores
+        let att_data = unsafe { att_scores.data_mut() };
+        for (h, head_scores) in scores.iter().enumerate() {
+            for (i, &score) in head_scores.iter().enumerate() {
+                att_data[h * n_groups * seq_len * total_seq_len + i] = score;
+            }
+        }
+    }
+
+    OP::masked_softmax(att_scores);
+
+    // 计算注意力输出
+    let att_data = att_scores.data();
+    let outputs: Vec<_> = (0..n_kv_h)
+        .into_par_iter()
+        .map(|kv_head| {
+            let mut head_output = vec![0.0; n_groups * seq_len * dqkv];
+
+            for group in 0..n_groups {
+                for i in 0..seq_len {
+                    let mut out_buf = vec![0.0; dqkv];
+
+                    let att_base = kv_head * (n_groups * seq_len * total_seq_len)
+                        + group * (seq_len * total_seq_len)
+                        + i * total_seq_len;
+
+                    let v_base = kv_head * dqkv;
+
+                    for j in 0..total_seq_len {
+                        let attn = att_data[att_base + j];
+                        let v_offset = j * n_kv_h * dqkv + v_base;
+
+                        for p in 0..dqkv {
+                            out_buf[p] += attn * v_data[v_offset + p];
+                        }
+                    }
+
+                    let out_offset = group * seq_len * dqkv + i * dqkv;
+                    head_output[out_offset..out_offset + dqkv].copy_from_slice(&out_buf);
                 }
             }
+            head_output
+        })
+        .collect();
 
-            // Apply softmax to scores
-            OP::masked_softmax(&mut scores);
-
-            // Get values for this head
-            let v_head = v.slice(h * dqkv, &[total_seq_len, dqkv]);
-
-            // Compute attention output (scores * V)
-            let out_offset = (h * n_groups + g) * dqkv;
-            let mut out = hidden_states.slice(0, &[seq_len, n_kv_h * n_groups * dqkv]);
-
-            unsafe {
-                let out_data = out.data_mut();
-                let scores_data = scores.data();
-                let v_data = v_head.data();
-
-                for i in 0..seq_len {
-                    for d in 0..dqkv {
-                        let mut sum = 0.0;
-                        for j in 0..total_seq_len {
-                            sum += scores_data[i * total_seq_len + j] * v_data[j * dqkv + d];
-                        }
-                        out_data[i * (n_kv_h * n_groups * dqkv) + out_offset + d] = sum;
-                    }
-                }
+    // 将计算结果写回 hidden_states
+    let out_data = unsafe { hidden_states.data_mut() };
+    for (h, head_output) in outputs.iter().enumerate() {
+        for group in 0..n_groups {
+            for i in 0..seq_len {
+                let src_offset = group * seq_len * dqkv + i * dqkv;
+                let dst_offset = (i * n_kv_h * n_groups + h * n_groups + group) * dqkv;
+                out_data[dst_offset..dst_offset + dqkv]
+                    .copy_from_slice(&head_output[src_offset..src_offset + dqkv]);
             }
         }
     }
 }
 
-/// 模型结构：Feed-Forward神经网络
-#[allow(clippy::too_many_arguments)]
 fn mlp(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
@@ -276,29 +319,31 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    // 1. hidden = rms_norm(residual)
+    // 1. 通过 RMS normalization 计算 hidden = rms_norm(residual)
     OP::rms_norm(hidden_states, residual, rms_w, eps);
 
-    // 2. gate = hidden @ gate_weight.T
-    // 3. up = hidden @ up_weight.T
+    // 2. 计算 gate = hidden @ gate_weight.T
+    //    注意：这里调用的是矩阵乘算子，设置 beta 为 0，alpha 为 1
     OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
+
+    // 3. 计算 up = hidden @ up_weight.T
     OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0);
 
-    // 4. act = gate * sigmoid(gate) * up  (SwiGLU activation)
+    // 4. 计算 SwiGLU 激活函数：act = gate * sigmoid(gate) * up
+    //    我们使用 swiglu 算子实现：传入的参数会将 up 的每个元素乘以 gate * sigmoid(gate)
+    //    执行后，up 中存储的就是 act 的结果
     OP::swiglu(up, gate);
 
-    // 5. output = act @ down_weight.T
-    // 结果直接存储在 residual 中，复用内存
-    OP::matmul_transb(residual, 0.0, up, w_down, 1.0);
+    // 5. 计算 output = act @ down_weight.T
+    //    输出 shape 为 [seq_len, d]，这里我们利用 hidden_states 这个缓冲区来存储 output
+    OP::matmul_transb(hidden_states, 0.0, up, w_down, 1.0);
 
-    // 6. residual = output + residual
-    // 在获取可变引用前先获取大小
-    let residual_size = residual.size();
-    let residual_data = unsafe { residual.data_mut() };
-    let hidden_data = hidden_states.data();
-
-    for i in 0..residual_size {
-        residual_data[i] += hidden_data[i];
+    // 6. 残差连接：更新 residual = output + residual
+    let out_data = hidden_states.data();
+    let size = residual.size();
+    let resid_data = unsafe { residual.data_mut() };
+    for i in 0..size {
+        resid_data[i] += out_data[i];
     }
 }
 
@@ -406,4 +451,165 @@ pub fn test_load_safetensors() {
         1e-6
     ));
     assert!(float_eq(&model.params.wo[0].data()[100], &0.01965332, 1e-6));
+}
+
+/// 表示一条对话消息
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub role: String,    // "user" 或 "assistant"
+    pub content: String, // 消息内容
+}
+
+pub struct ChatSession {
+    pub session_id: String,
+    pub history: Vec<String>,
+    pub model: Arc<Llama<f32>>,
+    pub cache: KVCache<f32>,
+}
+
+impl ChatSession {
+    pub fn new(session_id: String, model: Arc<Llama<f32>>) -> Self {
+        let cache = model.new_cache();
+        ChatSession {
+            session_id,
+            history: Vec::new(),
+            model,
+            cache,
+        }
+    }
+
+    pub fn add_user_message(&mut self, content: String) {
+        self.history.push(format!("User: {}", content));
+        self.cache = self.model.new_cache();
+    }
+
+    pub fn add_assistant_message(&mut self, content: String) {
+        self.history.push(format!("Assistant: {}", content));
+        self.cache = self.model.new_cache();
+    }
+
+    pub fn build_prompt(&self) -> String {
+        let mut prompt = String::new();
+        for msg in &self.history {
+            prompt.push_str("<|im_start|>");
+            prompt.push_str(&msg);
+            prompt.push_str("<|im_end|>\n");
+        }
+        prompt.push_str("<|im_start|>assistant\n");
+        prompt
+    }
+    pub fn chat(
+        &mut self,
+        prompt_ids: &[u32],
+        max_len: usize,
+        top_p: f32,
+        top_k: u32,
+        temperature: f32,
+    ) -> Vec<u32> {
+        let prompt_tensor = Tensor::<u32>::new(prompt_ids.to_vec(), &vec![prompt_ids.len()]);
+        let _ = self.model.forward(&prompt_tensor, &mut self.cache);
+
+        let mut generated = Vec::with_capacity(max_len);
+        let mut input_tensor = Tensor::<u32>::new(vec![0], &vec![1]);
+
+        for _ in 0..max_len {
+            let last_token = generated.last().map_or_else(
+                || prompt_ids.last().unwrap_or(&self.model.eos_token_id),
+                |t| t,
+            );
+
+            unsafe {
+                input_tensor.data_mut()[0] = *last_token;
+            }
+            let logits = self.model.forward(&input_tensor, &mut self.cache);
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+
+            if next_token == self.model.eos_token_id {
+                break;
+            }
+
+            generated.push(next_token);
+            print!(".");
+            std::io::stdout().flush().unwrap();
+        }
+        println!();
+
+        generated
+    }
+
+    pub fn get_history(&self) -> Vec<String> {
+        self.history.clone()
+    }
+
+    pub fn clear(&mut self) {
+        self.history.clear();
+        self.cache = self.model.new_cache();
+    }
+
+    pub fn rollback(&mut self, version_index: usize) {
+        if version_index < self.history.len() {
+            self.history.truncate(version_index);
+        }
+    }
+}
+pub struct SessionManager {
+    pub sessions: Mutex<HashMap<String, Arc<Mutex<ChatSession>>>>,
+}
+
+impl SessionManager {
+    /// 创建新的 SessionManager 实例
+    pub fn new() -> Self {
+        SessionManager {
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn create_session(&self, model: Arc<Llama<f32>>) -> String {
+        let session_id = Uuid::new_v4().to_string();
+        let session = ChatSession::new(session_id.clone(), model);
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), Arc::new(Mutex::new(session)));
+        session_id
+    }
+    pub fn get_session(&self, session_id: &str) -> Option<Arc<Mutex<ChatSession>>> {
+        self.sessions.lock().unwrap().get(session_id).cloned()
+    }
+    pub fn update_session(&self, session_id: &str, session: Arc<Mutex<ChatSession>>) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), session);
+    }
+
+    pub fn rollback_session(&self, session_id: &str, version_index: usize) -> Option<()> {
+        let sessions_lock = self.sessions.lock().unwrap();
+        if let Some(session_arc) = sessions_lock.get(session_id) {
+            let mut session = session_arc.lock().unwrap();
+            session.rollback(version_index);
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    pub fn list_sessions(&self) -> Vec<String> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.keys().cloned().collect()
+    }
+
+    pub fn get_or_create_session(
+        &self,
+        session_id: &str,
+        model: Arc<Llama<f32>>,
+    ) -> Arc<Mutex<ChatSession>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(ChatSession::new(session_id.to_string(), model)))
+            })
+            .clone()
+    }
 }

@@ -1,21 +1,53 @@
-use crate::tensor::Tensor;
+use crate::tensor::{Tensor, ToF32};
+use rayon::prelude::*;
+
+#[cfg(feature = "gpu")]
+use crate::gpu; // 引入 GPU kernel 实现
 
 // get (row) vectors from a 2D table given a list of indices
-pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
+#[cfg(feature = "gpu")]
+pub fn gather<U: Copy + ToF32 + Default + cust::memory::DeviceCopy>(
+    y: &mut Tensor<f32>,
+    indices: &Tensor<u32>,
+    table: &Tensor<U>,
+) {
+    // 调用 GPU 加速实现，gpu::gather_kernel 应该封装对 CUDA kernel 的调用
+    crate::gpu::gather_kernel(y, indices, table).expect("GPU gather failed");
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn gather<U: Copy + ToF32 + Default>(
+    y: &mut Tensor<f32>,
+    indices: &Tensor<u32>,
+    table: &Tensor<U>,
+) {
     let length = indices.size();
     let table_shape = table.shape();
     assert!(table_shape.len() == 2);
     let dim = table_shape[1];
     assert!(y.size() == length * dim);
+    let y_data = unsafe { y.data_mut() };
     for i in 0..length {
-        let src = &table.data()[indices.data()[i] as usize * dim..][..dim];
-        let dst = &mut unsafe { y.data_mut() }[i * dim..][..dim];
-        dst.copy_from_slice(src);
+        let idx = indices.data()[i] as usize;
+        let src_start = idx * dim;
+        let src = &table.data()[src_start..src_start + dim];
+        let dst = &mut y_data[i * dim..(i + 1) * dim];
+        for j in 0..dim {
+            dst[j] = src[j].to_f32();
+        }
     }
 }
 
 // RoPE: Rotary Positional Embedding
+#[cfg(feature = "gpu")]
 pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
+    // 调用 GPU 实现，对应的 GPU kernel 应在 crate::gpu 模块中实现
+    crate::gpu::rope_kernel(y, start_pos, theta).expect("GPU rope failed");
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
+    // 原有 CPU 实现
     let shape = y.shape();
     assert!(shape.len() == 3);
     let seq_len = shape[0];
@@ -39,7 +71,15 @@ pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
 
 // softmax(x) = exp(x - max) / sum(exp(x - max))
 // y = softmax(mask(x))
+#[cfg(feature = "gpu")]
 pub fn masked_softmax(y: &mut Tensor<f32>) {
+    // 调用 GPU 实现。如果需要，GPU 版本可以将 softmax 操作在 kernel 中并行化
+    crate::gpu::masked_softmax_kernel(y).expect("GPU masked_softmax failed");
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn masked_softmax(y: &mut Tensor<f32>) {
+    // 原有 CPU 实现
     let ndim = y.shape().len();
     assert!(ndim >= 2);
     let seq_len = y.shape()[ndim - 2];
@@ -70,132 +110,115 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
     }
 }
 
+#[cfg(feature = "gpu")]
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    // 1. 检查输入的合法性
-    assert_eq!(
-        x.shape(),
-        y.shape(),
-        "Input and output tensors must have the same shape"
-    );
+    // 调用 GPU 实现，GPU 内核应完成归一化操作
+    crate::gpu::rms_norm_kernel(y, x, w, epsilon).expect("GPU rms_norm failed");
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
+    // 原有 CPU 实现
     let x_shape = x.shape();
-    assert!(!x_shape.is_empty(), "Input tensor cannot be empty");
+    assert!(x_shape.len() >= 1, "x 必须至少为1维的张量");
+    let n = *x_shape.last().unwrap() as usize;
 
-    // 获取最后一维的大小
-    let last_dim = *x_shape.last().unwrap();
+    assert!(y.size() == x.size(), "y 与 x 的元素数量必须一致");
+    assert!(w.size() == n, "权重张量 w 的大小必须与最后一维一致");
 
-    // 检查权重向量维度
-    assert_eq!(
-        w.shape(),
-        &vec![last_dim],
-        "Weight tensor must match the last dimension"
-    );
+    let total = x.size();
+    let _batch = total / n;
 
-    // 2. 获取数据访问
     let x_data = x.data();
-    let w_data = w.data();
     let y_data = unsafe { y.data_mut() };
+    let w_data = w.data();
 
-    // 计算向量数量（总元素数除以最后一维的大小）
-    let total_size = x.size();
-    let num_vectors = total_size / last_dim;
-
-    // 3. 对每个向量进行 RMS Normalization
-    for i in 0..num_vectors {
-        let start_idx = i * last_dim;
-
-        // 计算均方和
-        let mut sum_squares = 0.0f32;
-        for j in 0..last_dim {
-            let val = x_data[start_idx + j];
-            sum_squares += val * val;
-        }
-
-        // 计算 RMS (root mean square)
-        let rms = (sum_squares / last_dim as f32 + epsilon).sqrt();
-
-        // 应用归一化和权重
-        for j in 0..last_dim {
-            let idx = start_idx + j;
-            y_data[idx] = (x_data[idx] / rms) * w_data[j];
-        }
-    }
+    y_data
+        .par_chunks_mut(n)
+        .enumerate()
+        .for_each(|(b, y_chunk)| {
+            let x_chunk = &x_data[b * n..(b + 1) * n];
+            let sum_sq: f32 = x_chunk.iter().map(|&v| v * v).sum();
+            let norm_factor = ((sum_sq / n as f32) + epsilon).sqrt();
+            for j in 0..n {
+                y_chunk[j] = w_data[j] * x_chunk[j] / norm_factor;
+            }
+        });
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
+#[cfg(feature = "gpu")]
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
+    // 调用 GPU 实现，GPU kernel 内部将完成 element-wise 计算
+    crate::gpu::swiglu_kernel(y, x).expect("GPU swiglu failed");
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
+    // 原有 CPU 实现
     let len = y.size();
-    assert!(len == x.size(), "Tensors must have the same size");
-
-    // Get mutable slice for y and immutable slice for x
-    let y_data = unsafe { y.data_mut() };
+    assert!(len == x.size());
     let x_data = x.data();
-
-    // Perform element-wise SwiGLU operation
-    // SwiGLU: y = silu(x) * y
-    // where silu(x) = x * sigmoid(x)
+    let y_data = unsafe { y.data_mut() };
     for i in 0..len {
-        // Calculate sigmoid(x): 1 / (1 + e^(-x))
-        let sigmoid_x = 1.0 / (1.0 + (-x_data[i]).exp());
-
-        // Calculate silu(x) = x * sigmoid(x)
-        let silu_x = x_data[i] * sigmoid_x;
-
-        // Multiply result with y (in-place)
-        y_data[i] *= silu_x;
+        let xi = x_data[i];
+        let sigmoid = 1.0 / (1.0 + (-xi).exp());
+        let silu = xi * sigmoid;
+        y_data[i] *= silu;
     }
 }
 
-/// 矩阵乘（Transpose B）算子
-/// C = beta * C + alpha * A @ B^T
-/// hint: You don't need to do an explicit transpose of B
-pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    // 1. 获取维度信息并进行检查
+// C = beta * C + alpha * A @ B^T
+// hint: You don't need to do an explicit transpose of B
+#[cfg(feature = "gpu")]
+pub fn matmul_transb<U: Copy + ToF32 + Default + Sync + cust::memory::DeviceCopy>(
+    c: &mut Tensor<f32>,
+    beta: f32,
+    a: &Tensor<f32>,
+    b: &Tensor<U>,
+    alpha: f32,
+) {
+    // 调用 GPU 实现，可以使用 cuBLAS 等库来完成矩阵乘法
+    crate::gpu::matmul_transb_kernel(c, beta, a, b, alpha).expect("GPU matmul_transb failed");
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn matmul_transb<U: Copy + ToF32 + Default + Sync>(
+    c: &mut Tensor<f32>,
+    beta: f32,
+    a: &Tensor<f32>,
+    b: &Tensor<U>,
+    alpha: f32,
+) {
+    // 原有 CPU 实现
     let a_shape = a.shape();
+    assert!(a_shape.len() == 2, "A 必须是二维矩阵");
+    let m = a_shape[0];
+    let k = a_shape[1];
+
     let b_shape = b.shape();
+    assert!(b_shape.len() == 2, "B 必须是二维矩阵");
+    assert!(b_shape[1] == k, "B 的列数必须与 A 的列数相等");
+    let n = b_shape[0];
+
     let c_shape = c.shape();
+    assert!(c_shape.len() == 2, "C 必须是二维矩阵");
+    assert!(c_shape[0] == m && c_shape[1] == n, "C 的形状必须为 m×n");
 
-    assert_eq!(a_shape.len(), 2, "Matrix A must be 2-dimensional");
-    assert_eq!(b_shape.len(), 2, "Matrix B must be 2-dimensional");
-    assert_eq!(c_shape.len(), 2, "Matrix C must be 2-dimensional");
-
-    let (m, k) = (a_shape[0], a_shape[1]); // A: m × k
-    let (n, b_k) = (b_shape[0], b_shape[1]); // B: n × b_k
-
-    // 修改维度检查：A的列数(k)应该等于B的列数(b_k)
-    assert_eq!(
-        k, b_k,
-        "Inner dimensions must match for A @ B^T: A is {}×{}, B is {}×{}",
-        m, k, n, b_k
-    );
-    assert_eq!(c_shape[0], m, "Output matrix C must have {} rows", m);
-    assert_eq!(c_shape[1], n, "Output matrix C must have {} columns", n);
-
-    // 2. 获取数据访问
     let a_data = a.data();
     let b_data = b.data();
     let c_data = unsafe { c.data_mut() };
 
-    // 3. 实现 C = beta * C + alpha * A @ B^T
-    // 对每个输出元素 C[i,j] 计算
-    for i in 0..m {
+    c_data.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
         for j in 0..n {
-            let c_idx = i * n + j;
-
-            // 首先应用 beta * C
-            let mut sum = beta * c_data[c_idx];
-
-            // 计算 A @ B^T 的对应元素
-            // C[i,j] = sum(A[i,k] * B[j,k]) 因为B是转置的
+            let mut sum = 0.0;
             for p in 0..k {
-                let a_idx = i * k + p; // A[i,p]
-                let b_idx = j * b_k + p; // B[j,p]
-                sum += alpha * a_data[a_idx] * b_data[b_idx];
+                sum += a_data[i * k + p] * b_data[j * k + p].to_f32();
             }
-
-            c_data[c_idx] = sum;
+            row[j] = beta * row[j] + alpha * sum;
         }
-    }
+    });
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -213,7 +236,6 @@ pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
 }
 
 // Sample a index from a tensor (treated as a probability vector)
-#[warn(dead_code)]
 pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) -> u32 {
     assert!(x.shape()[x.shape().len() - 1] == x.size());
     if temperature <= 0. || top_k < 2 || top_p <= 0. {
@@ -251,7 +273,7 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
         #[inline]
         fn from((i, p): (usize, &f32)) -> Self {
             Self {
-                val: *p,
+                val: p.clone(),
                 tok: i as _,
             }
         }
