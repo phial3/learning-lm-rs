@@ -1,4 +1,5 @@
 use std::{slice, sync::Arc, vec};
+#[derive(Clone)]
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
@@ -7,17 +8,17 @@ pub struct Tensor<T> {
 }
 
 impl<T: Copy + Clone + Default> Tensor<T> {
-    pub fn new(data: Vec<T>, shape: &[usize]) -> Self {
+    pub fn new(data: Vec<T>, shape: &Vec<usize>) -> Self {
         let length = data.len();
         Tensor {
-            data: Arc::new(data.into_boxed_slice()),
-            shape: shape.to_owned(),
+            data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
+            shape: shape.clone(),
             offset: 0,
-            length,
+            length: length,
         }
     }
 
-    pub fn default(shape: &[usize]) -> Self {
+    pub fn default(shape: &Vec<usize>) -> Self {
         let length = shape.iter().product();
         let data = vec![T::default(); length];
         Self::new(data, shape)
@@ -51,20 +52,28 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         self
     }
 
-    pub fn slice(&self, start: usize, shape: &[usize]) -> Self {
+    pub fn slice(&self, start: usize, shape: &Vec<usize>) -> Self {
         let new_length: usize = shape.iter().product();
         assert!(self.offset + start + new_length <= self.length);
         Tensor {
             data: self.data.clone(),
-            shape: shape.to_owned(),
+            shape: shape.clone(),
             offset: self.offset + start,
             length: new_length,
         }
     }
+
+
 }
 
 // Some helper functions for testing and debugging
 impl Tensor<f32> {
+    pub fn all_reduce(&mut self, tensor: Tensor<f32>) {
+        assert!(self.shape() == tensor.shape());
+        let _self = unsafe { self.data_mut() };
+        let _tensor = tensor.data();
+        _self.iter_mut().zip(_tensor.iter()).for_each(|(a, b)| { *a += b; });
+    }
     #[allow(unused)]
     pub fn close_to(&self, other: &Self, rel: f32) -> bool {
         if self.shape() != other.shape() {
@@ -72,16 +81,12 @@ impl Tensor<f32> {
         }
         let a = self.data();
         let b = other.data();
-
-        a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel))
+        
+        return a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel));
     }
-
     #[allow(unused)]
-    pub fn print(&self) {
-        println!(
-            "shpae: {:?}, offset: {}, length: {}",
-            self.shape, self.offset, self.length
-        );
+    pub fn print(&self){
+        println!("shpae: {:?}, offset: {}, length: {}", self.shape, self.offset, self.length);
         let dim = self.shape()[self.shape().len() - 1];
         let batch = self.length / dim;
         for i in 0..batch {

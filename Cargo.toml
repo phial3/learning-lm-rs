@@ -12,3 +12,10 @@ rand = "0.8"
 half = "2.6"
 rayon = "1.10"
 dashmap = "6.1"
+num_cpus = "1.16"
+
+[features]
+default = ["distributed", "chat"]
+distributed = []
+chat = []
+story = []
