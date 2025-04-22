@@ -1,6 +1,4 @@
 use crate::tensor::Tensor;
-use core::panic;
-use rayon::prelude::*;
 
 // get (row) vectors from a 2D table given a list of indices
 pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
@@ -46,18 +44,22 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
     assert!(ndim >= 2);
     let seq_len = y.shape()[ndim - 2];
     let total_seq_len = y.shape()[ndim - 1];
+    // 只有1次循环
     let batch = y.size() / (seq_len * total_seq_len);
     let data = unsafe { y.data_mut() };
     for b in 0..batch {
+        // 句子的长度offset
         let base = b * seq_len * total_seq_len;
         for i in 0..seq_len {
+            // 在哪一行的那一列offset
             let offset = base + i * total_seq_len;
+            // +1是倒不了
             let boundary = total_seq_len - seq_len + i + 1;
 
             let max = data[offset..offset + boundary]
                 .iter()
                 .fold(data[offset], |a, b| a.max(*b));
-
+            // 闭包查找最大值,当前值a和下一个值b比较，返回最大值
             let sum = (0..boundary)
                 .map(|j| {
                     let e = (data[offset + j] - max).exp();
@@ -65,173 +67,189 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
                     e
                 })
                 .sum::<f32>();
-
+            // 生成的e求和
             (0..boundary).for_each(|j| data[offset + j] /= sum);
+            // 后面的全部看不到的位置填充0
             (boundary..total_seq_len).for_each(|j| data[offset + j] = 0.0);
         }
     }
 }
 
-// shape boardcast
-pub fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Vec<usize> {
-    let len1 = shape1.len();
-    let len2 = shape2.len();
-    let max_len = len1.max(len2);
-    let mut shape = Vec::with_capacity(max_len);
-    // 逐个从后往前匹配维度
-    for i in 0..max_len {
-        let dim1 = if i < len1 { shape1[len1 - 1 - i] } else { 1 };
-        let dim2 = if i < len2 { shape2[len2 - 1 - i] } else { 1 };
-        // 维度要么相等，要么有一个是1，否则不能广播
-        if dim1 != dim2 && dim1 != 1 && dim2 != 1 {
-            panic!("Cannot broadcast shapes {:?} and {:?}", shape1, shape2);
-        }
-        shape[max_len - 1 - i] = dim1.max(dim2);
-    }
-    shape
-}
-
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    let shape_x = x.shape();
-    let shape_y = y.shape();
+    let len = y.size();
+    assert!(len == x.size());
+    let n_col = y.shape()[y.shape().len() - 1];
+    let n_row = y.shape()[y.shape().len() - 2];
+    let batch = y.size() / (n_col * n_row);
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    // 获取多少个列向量
 
-    // 检查 x 和 y 的最后一维是否相同
-    let n_x = *shape_x.last().unwrap();
-    let n_y = *shape_y.last().unwrap();
-    assert_eq!(n_x, n_y, "x and y must have the same last dimension");
+    // 计算每一个列项的长度,直接使用w
+    // 计算多少个block,对每一个block里面的列向量来增加
+    // for b in (0..batch){
+    //     let base = b * n_col * n_row;
+    //     let mut rec = vec![0.0 as f32;n_col];
+    //     for i in (0..n_col*n_row){
+    //         // 获取当前的x
+    //         // _y[i+base] = _x[i+base]*w.data()[(i+base)%n_col];
+    //         // 统计x[i]
 
-    // 检查 w 的长度是否与最后一维 n 相同
-    assert_eq!(
-        w.size(),
-        n_x,
-        "w must have the same length as the last dimension of x"
-    );
+    //         rec[i%n_col]+= _x[i+base]*_x[i+base];
+    //     }
+    //     rec.iter_mut().for_each(|j|*j =(*j/n_row as f32).sqrt()+epsilon);
+    //     for i in (0..n_col*n_row){
+    //         // 获取当前的x
+    //         _y[i+base] = _x[i+base]*w.data()[(i)%n_col]/rec[i%n_col];
+    //         // 统计x[i]
 
-    // 计算 x 和 y 的总元素数
-    let len_x = x.size();
-    let len_y = y.size();
+    //     }
+    // }
+    // 预分配 rec 向量，并在每个批次前重置
 
-    // 计算 x 和 y 的最后一维之前的维度大小
-    let num_vectors_x = len_x / n_x;
-    let num_vectors_y = len_y / n_y;
+    let mut rec = vec![0.0f32; n_row];
+    for b in 0..batch {
+        let base = b * n_col * n_row;
 
-    // 检查 x 和 y 的向量数量是否匹配
-    assert_eq!(
-        num_vectors_x, num_vectors_y,
-        "x and y must have the same number of vectors"
-    );
+        // 重置 rec 向量
+        for j in 0..n_row {
+            rec[j] = 0.0;
+        }
 
-    // 获取 y 的可变数据引用
-    let y_data = unsafe { y.data_mut() };
-    let x_data = x.data();
-    let w_data = w.data();
+        // 计算每一行的平方和
+        for i in 0..(n_col * n_row) {
+            let row_idx = i / n_col;
+            rec[row_idx] += _x[i + base] * _x[i + base];
+        }
 
-    // 对每个向量进行 RMS 归一化
-    for i in 0..num_vectors_x {
-        let start_index_x = i * n_x;
-        let end_index_x = start_index_x + n_x;
+        // 计算 RMS 并添加 epsilon
+        for j in 0..n_row {
+            rec[j] = (rec[j] / n_col as f32).sqrt() + epsilon;
+        }
 
-        let start_index_y = i * n_y;
-
-        // 计算 RMS
-        let rms: f32 = x_data[start_index_x..end_index_x]
-            .iter()
-            .map(|&x| x * x)
-            .sum();
-        let mu = (rms / (n_x as f32) + epsilon).sqrt();
-
-        // 计算归一化结果
-        for j in 0..n_x {
-            y_data[start_index_y + j] = x_data[start_index_x + j] * w_data[j] / mu;
+        // 归一化并应用权重
+        for i in 0..(n_col * n_row) {
+            let row_idx = i / n_col;
+            let col_idx = i % n_col;
+            _y[i + base] = _x[i + base] * w.data()[col_idx] / rec[row_idx];
         }
     }
+
+    // 首先计算输出有多少个block
+    // 之后对每一个block来开始进行按照+col的来计算
+    // 得到最后的长度
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    assert!(
-        y.shape() == x.shape(),
-        "swiglu: x and y must have the same shape"
-    );
-
     let len = y.size();
-    let y = unsafe { y.data_mut() };
-    let x = x.data();
+    assert!(len == x.size());
 
-    for i in 0..len {
-        y[i] = y[i] * x[i] * (1.0 / ((-x[i]).exp() + 1.0));
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    let shape_x = x.shape();
+    // step1:获取整个长度进行sigmoid
+    let x_len = x.size();
+    let mut out = Tensor::new(vec![0.0; x_len], shape_x);
+    let _out = unsafe { out.data_mut() };
+    // (0..x_len).for_each(|j|_out[j]=1.0/(1.0+(-_x[j]).exp()));
+
+    // (0..x_len).for_each(|j|_out[j]*=_x[j]);
+    // (0..x_len).for_each(|j|_y[j]*=_out[j]);
+    // todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    // 优化到一个
+    for (y_it, x_it) in _y.iter_mut().zip(_x) {
+        let sig = 1.0 / (1.0 + (-x_it).exp());
+        let six = *x_it * sig;
+        *y_it *= six;
     }
 }
 
+pub fn matmul_transb1(
+    c: &mut Tensor<f32>,
+    beta: f32,
+    a: &Tensor<f32>,
+    b: &Tensor<f32>,
+    alpha: f32,
+) {
+    // 确保 A 和 B 能进行矩阵乘法
+    assert!(a.shape().len() == b.shape().len());
+    // 确保 A 和 C 能进行矩阵加法
+    assert!(a.shape().len() == c.shape().len());
+
+    let ndim = a.shape().len();
+    assert!(ndim >= 2);
+    let a_row = a.shape()[ndim - 2];
+    let a_col = a.shape()[ndim - 1];
+
+    let b_row = b.shape()[ndim - 2];
+    let b_col = b.shape()[ndim - 1];
+
+    let c_row = c.shape()[ndim - 2];
+    let c_col = c.shape()[ndim - 1];
+
+    let _c = unsafe { c.data_mut() };
+    let _a = a.data();
+    let _b = b.data();
+
+    assert!(a_col == b_col);
+    assert!(c_col == b_row);
+    assert!(a_row == c_row);
+
+    for l in 0..c_row {
+        for i in 0..c_col {
+            let sum = (0..a_col)
+                .map(|j| _a[l * a_col + j] * _b[i * b_col + j])
+                .sum::<f32>();
+            _c[l * c_col + i] = beta * _c[l * c_col + i] + alpha * sum;
+        }
+    }
+}
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    let shape_c = c.shape();
-    let shape_a = a.shape();
-    let shape_b = b.shape();
-    assert!(shape_b.len() == 2 && shape_a.len() == 2 && shape_c.len() == 2);
-
-    let m = shape_a[0];
-    let k_dim = shape_a[1];
-    let n = shape_b[0];
-    assert_eq!(
-        shape_a[1], shape_b[1],
-        "a cols {} != b cols {}",
-        shape_a[1], shape_b[1]
-    );
-    assert_eq!(shape_c, &[m, n], "c shape mismatch");
-
-    // 获取底层数据指针
-    let c_data = unsafe { c.data_mut() };
-    let a_data = a.data();
-    let b_data = b.data();
-
-    // 并行处理每一行
-    c_data.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
-        let a_row = &a_data[i * k_dim..(i + 1) * k_dim];
-
-        // 对每列进行并行计算
-        c_row.par_iter_mut().enumerate().for_each(|(j, c_val)| {
-            let mut sum = 0.0;
-            let b_row = &b_data[j * k_dim..(j + 1) * k_dim];
-
-            // 展开循环以提高性能
-            for k in (0..k_dim).step_by(4) {
-                let end = (k + 4).min(k_dim);
-                sum += a_row[k..end]
-                    .iter()
-                    .zip(&b_row[k..end])
-                    .map(|(&a, &b)| a * b)
-                    .sum::<f32>();
+    let a_row = a.shape()[a.shape().len() - 2];
+    let a_col = a.shape()[a.shape().len() - 1];
+    let b_row = b.shape()[b.shape().len() - 2];
+    let b_col = b.shape()[b.shape().len() - 1];
+    let c_row = c.shape()[c.shape().len() - 2];
+    let c_col = c.shape()[c.shape().len() - 1];
+    assert!(a_col == b_col);
+    assert!(a_row == c_row);
+    assert!(b_row == c_col);
+    // 计算batch
+    let batch = c.size() / (c_row * c_col);
+    let _c = unsafe { c.data_mut() };
+    let _a = a.data();
+    let _b = b.data();
+    let a_batch = a.size() / (a_row * a_row);
+    let b_batch = b.size() / (b_row * b_row);
+    // assert!(a_batch == b_batch);
+    for j in _c.iter_mut() {
+        *j *= beta;
+    }
+    for b in 0..batch {
+        let c_offset = b * c_row * c_col;
+        let a_offset = b * a_row * a_col;
+        let b_offset = b * b_row * b_col;
+        for i in 0..c_row {
+            for j in 0..c_col {
+                // _c[i*c_col+j+c_offset]+=
+                //     获取a，b来进行点击
+                let ax = Tensor::new(
+                    _a[(a_offset + i * a_col)..(a_offset + (i + 1) * a_col)].to_vec(),
+                    &[1, a_col],
+                );
+                let by = Tensor::new(
+                    _b[(b_offset + j * b_col)..(b_offset + (j + 1) * b_col)].to_vec(),
+                    &[1, b_col],
+                );
+                let plus = dot(&ax, &by) * alpha;
+                _c[i * c_col + j + c_offset] += plus;
             }
-
-            *c_val = *c_val * beta + sum * alpha;
-        });
-    });
-}
-
-// 辅助函数保持与之前相同的实现（移除了显式转置）
-#[allow(unused)]
-fn caculate2mat(a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) -> Vec<f32> {
-    let shape_a = a.shape();
-    let shape_b = b.shape();
-    let _m = shape_a[0];
-    let n = shape_b[0];
-    let k_dim = shape_a[1];
-
-    a.data()
-        .par_chunks(shape_a[1])
-        .flat_map(|a_row| {
-            (0..n)
-                .into_par_iter()
-                .map(|j| {
-                    let b_row = &b.data()[j * k_dim..(j + 1) * k_dim];
-                    a_row.iter().zip(b_row).map(|(&a, &b)| a * b).sum::<f32>() * alpha
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -316,6 +334,7 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
 // Your implementation should at least pass the following tests:
 #[test]
 fn test_silu() {
+    // 句子长度为 1，词向量长度为 3
     let mut y = Tensor::<f32>::new(vec![2., 3., 4.], &vec![1, 3]);
     let x = Tensor::<f32>::new(vec![1., 2., 3.], &vec![1, 3]);
     swiglu(&mut y, &x);
@@ -331,6 +350,7 @@ fn test_rms_norm() {
     let x = Tensor::<f32>::new(vec![1., 2., 3., 4.], &vec![2, 2]);
     let w = Tensor::<f32>::new(vec![1., 2.], &vec![2]);
     rms_norm(&mut y, &x, &w, 1e-6);
+    println!("{:?}", y);
     assert!(y.close_to(
         &Tensor::<f32>::new(
             vec![0.6324554, 2.5298216, 0.8485281, 2.2627416],
@@ -350,10 +370,4 @@ fn test_matmul_transb() {
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
     ));
-}
-
-#[test]
-#[should_panic]
-fn test_invalid_broadcast() {
-    broadcast_shapes(&[2, 3], &[3, 2]);
 }
